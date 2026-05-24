@@ -4,10 +4,48 @@ use serde_json::Value;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use tycho_types::boc::Boc;
 
 const SIMPLE_CONTRACT: &str = r"
 fun onInternalMessage(in: InMessage) {}
 fun onBouncedMessage(_: InMessageBounced) {}
+";
+
+const PRECOMPILED_TYPES: &str = r"
+struct (0x00000001) Increment {
+    value: int32
+}
+
+get fun currentCounter(): int {
+    return 0;
+}
+
+contract Precompiled {
+    incomingMessages: Increment
+}
+";
+
+const PRECOMPILED_RUNTIME_CONTRACT: &str = r"
+struct (0x00000001) Increment {
+    value: int32
+}
+
+get fun currentCounter(): int {
+    return 0;
+}
+
+contract Precompiled {
+    incomingMessages: Increment
+}
+
+fun onInternalMessage(_: InMessage) {}
+fun onBouncedMessage(_: InMessageBounced) {}
+";
+
+const INVALID_PRECOMPILED_TYPES: &str = r"
+contract Precompiled {
+    incomingMessages: MissingMessage
+}
 ";
 
 #[cfg(unix)]
@@ -66,6 +104,37 @@ fn setup_fake_typescript_generator(project_root: &Path) -> (PathBuf, String) {
     (capture_path, path_env)
 }
 
+fn point_precompiled_contract_to_uppercase_boc(project: &crate::support::project::Project) {
+    fs::rename(
+        project.path().join("contracts/precompiled.boc"),
+        project.path().join("contracts/precompiled.BOC"),
+    )
+    .expect("should rename BoC fixture");
+
+    let manifest_path = project.path().join("Acton.toml");
+    let manifest = fs::read_to_string(&manifest_path).expect("should read Acton.toml");
+    fs::write(
+        &manifest_path,
+        manifest.replace("contracts/precompiled.boc", "contracts/precompiled.BOC"),
+    )
+    .expect("should update Acton.toml");
+}
+
+fn compiled_precompiled_wrapper_boc_bytes() -> Vec<u8> {
+    let source_project = ProjectBuilder::new("wrapper-boc-with-types-source")
+        .contract_with_output(
+            "precompiled",
+            PRECOMPILED_RUNTIME_CONTRACT,
+            "contracts/precompiled.boc",
+        )
+        .build();
+
+    source_project.acton().build().run().success();
+
+    fs::read(source_project.path().join("contracts/precompiled.boc"))
+        .expect("must read compiled precompiled wrapper boc bytes")
+}
+
 #[test]
 fn test_wrapper_generation_defaults() {
     let project = ProjectBuilder::new("wrapper_simple")
@@ -121,6 +190,400 @@ fn test_wrapper_generation_without_test_stub() {
     assert!(
         !project.path().join("tests/my_contract.test.tolk").exists(),
         "Test file should not exist"
+    );
+}
+
+#[test]
+fn test_wrapper_generation_keeps_source_file_stem_for_wrapper_name() {
+    let project = ProjectBuilder::new("wrapper_file_stem_name")
+        .contract(
+            "configured_file",
+            r"
+                struct (0x00000001) Ping {}
+
+                contract DifferentHeader {
+                    incomingMessages: Ping
+                }
+
+                fun onInternalMessage(in: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("configured_file")
+        .run()
+        .success()
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_generation_keeps_source_file_stem_for_wrapper_name/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/ConfiguredFile.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_keeps_source_file_stem_for_wrapper_name/wrapper.tolk.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_all_skips_boc_contracts() {
+    let project = ProjectBuilder::new("wrapper_all_skips_boc")
+        .contract_from_boc("precompiled", vec![0xFF, 0xFF, 0xFF, 0xFF])
+        .contract("source", SIMPLE_CONTRACT)
+        .build();
+
+    let output = project
+        .acton()
+        .arg("wrapper")
+        .arg("--all")
+        .current_dir(project.path())
+        .run()
+        .success();
+
+    output
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_all_skips_boc_contracts/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Source.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_all_skips_boc_contracts/wrapper.tolk.txt",
+        );
+
+    let mut generated_wrappers = fs::read_dir(project.path().join("wrappers"))
+        .expect("failed to read wrappers directory")
+        .map(|entry| {
+            entry
+                .expect("failed to read wrappers directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    generated_wrappers.sort();
+
+    let mut snapshot_path = env::current_dir().expect("failed to get current directory");
+    snapshot_path.push(
+        "tests/integration/snapshots/wrapper/test_wrapper_all_skips_boc_contracts/wrappers.txt",
+    );
+    crate::common::assertion().eq(
+        format!("{}\n", generated_wrappers.join("\n")),
+        snapbox::Data::read_from(&snapshot_path, None),
+    );
+}
+
+#[test]
+fn test_wrapper_generation_from_boc_contract_with_types() {
+    let boc_bytes = compiled_precompiled_wrapper_boc_bytes();
+    let project = ProjectBuilder::new("wrapper_boc_with_types")
+        .mapping("acton", ".acton")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/precompiled.types.tolk")
+        .raw_file("contracts/precompiled.types.tolk", PRECOMPILED_TYPES)
+        .build();
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_generation_from_boc_contract_with_types/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Precompiled.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_from_boc_contract_with_types/wrapper.tolk.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("tests/precompiled.test.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_from_boc_contract_with_types/test.tolk.txt",
+        );
+
+    project
+        .acton()
+        .test()
+        .run()
+        .success()
+        .assert_passed(1)
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_generation_from_boc_contract_with_types/test_stdout.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_generation_from_uppercase_boc_contract_with_types() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_uppercase_boc_with_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/precompiled.types.tolk")
+        .raw_file("contracts/precompiled.types.tolk", PRECOMPILED_TYPES)
+        .build();
+    point_precompiled_contract_to_uppercase_boc(&project);
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .run()
+        .success()
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_generation_from_uppercase_boc_contract_with_types/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Precompiled.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_from_uppercase_boc_contract_with_types/wrapper.tolk.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_all_includes_boc_contracts_with_types() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_all_boc_with_types")
+        .contract_from_boc("skipped_boc", boc_bytes.clone())
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/precompiled.types.tolk")
+        .raw_file("contracts/precompiled.types.tolk", PRECOMPILED_TYPES)
+        .contract("source", SIMPLE_CONTRACT)
+        .build();
+
+    let output = project
+        .acton()
+        .arg("wrapper")
+        .arg("--all")
+        .current_dir(project.path())
+        .run()
+        .success();
+
+    output
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_all_includes_boc_contracts_with_types/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Precompiled.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_all_includes_boc_contracts_with_types/precompiled_wrapper.tolk.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Source.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_all_includes_boc_contracts_with_types/source_wrapper.tolk.txt",
+        );
+
+    let mut generated_wrappers = fs::read_dir(project.path().join("wrappers"))
+        .expect("failed to read wrappers directory")
+        .map(|entry| {
+            entry
+                .expect("failed to read wrappers directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    generated_wrappers.sort();
+
+    let mut snapshot_path = env::current_dir().expect("failed to get current directory");
+    snapshot_path.push(
+        "tests/integration/snapshots/wrapper/test_wrapper_all_includes_boc_contracts_with_types/wrappers.txt",
+    );
+    crate::common::assertion().eq(
+        format!("{}\n", generated_wrappers.join("\n")),
+        snapbox::Data::read_from(&snapshot_path, None),
+    );
+}
+
+#[test]
+fn test_wrapper_all_treats_empty_boc_types_as_absent() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_all_empty_boc_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "")
+        .contract("source", SIMPLE_CONTRACT)
+        .build();
+
+    let output = project
+        .acton()
+        .arg("wrapper")
+        .arg("--all")
+        .current_dir(project.path())
+        .run()
+        .success();
+
+    output
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_all_treats_empty_boc_types_as_absent/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/Source.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_all_treats_empty_boc_types_as_absent/source_wrapper.tolk.txt",
+        );
+
+    let mut generated_wrappers = fs::read_dir(project.path().join("wrappers"))
+        .expect("failed to read wrappers directory")
+        .map(|entry| {
+            entry
+                .expect("failed to read wrappers directory entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+    generated_wrappers.sort();
+
+    let mut snapshot_path = env::current_dir().expect("failed to get current directory");
+    snapshot_path.push(
+        "tests/integration/snapshots/wrapper/test_wrapper_all_treats_empty_boc_types_as_absent/wrappers.txt",
+    );
+    crate::common::assertion().eq(
+        format!("{}\n", generated_wrappers.join("\n")),
+        snapbox::Data::read_from(&snapshot_path, None),
+    );
+}
+
+#[test]
+fn test_wrapper_for_boc_contract_without_types_reports_actionable_error() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_boc_without_types")
+        .contract_from_boc("precompiled", boc_bytes)
+        .build();
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .run()
+        .failure()
+        .assert_stderr_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_for_boc_contract_without_types_reports_actionable_error/stderr.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_for_boc_contract_with_empty_types_reports_actionable_error() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_boc_empty_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "")
+        .build();
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .run()
+        .failure()
+        .assert_stderr_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_for_boc_contract_with_empty_types_reports_actionable_error/stderr.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_for_boc_contract_with_missing_types_file_reports_error() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_boc_missing_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/missing.types.tolk")
+        .build();
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .run()
+        .failure()
+        .assert_stderr_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_for_boc_contract_with_missing_types_file_reports_error/stderr.txt",
+        );
+}
+
+#[test]
+fn test_wrapper_for_boc_contract_with_invalid_types_file_reports_error() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let project = ProjectBuilder::new("wrapper_boc_invalid_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/precompiled.types.tolk")
+        .raw_file(
+            "contracts/precompiled.types.tolk",
+            INVALID_PRECOMPILED_TYPES,
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .run()
+        .failure()
+        .assert_stderr_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_for_boc_contract_with_invalid_types_file_reports_error/stderr.txt",
+        );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_wrapper_generation_typescript_from_boc_contract_with_types() {
+    let boc_bytes = fs::read("tests/integration/testdata/child.boc").unwrap();
+    let expected_code_boc64 =
+        Boc::encode_base64(Boc::decode(&boc_bytes).expect("precompiled BoC fixture should decode"));
+    let project = ProjectBuilder::new("wrapper_typescript_boc_with_types")
+        .contract_from_boc_with_types("precompiled", boc_bytes, "contracts/precompiled.types.tolk")
+        .raw_file("contracts/precompiled.types.tolk", PRECOMPILED_TYPES)
+        .raw_file("bin/npx", FAKE_TYPESCRIPT_GENERATOR)
+        .build();
+    let (capture_path, path_env) = setup_fake_typescript_generator(project.path());
+
+    project
+        .acton()
+        .wrapper("precompiled")
+        .generate_typescript_wrapper()
+        .env("PATH", &path_env)
+        .env(
+            "ACTON_TS_WRAPPER_CAPTURE",
+            capture_path.to_str().expect("capture path"),
+        )
+        .run()
+        .success()
+        .assert_snapshot_matches(
+            "integration/snapshots/wrapper/test_wrapper_generation_typescript_from_boc_contract_with_types/output.txt",
+        )
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers-ts/Precompiled.gen.ts")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_typescript_from_boc_contract_with_types/wrapper.ts.txt",
+        )
+        .assert_file_snapshot_matches(
+            capture_path.to_str().expect("capture path"),
+            "integration/snapshots/wrapper/test_wrapper_generation_typescript_from_boc_contract_with_types/abi.json",
+        );
+
+    let abi_json: Value = serde_json::from_str(&fs::read_to_string(&capture_path).unwrap())
+        .expect("captured ABI JSON should be valid");
+    assert_eq!(
+        abi_json["code_boc64"]
+            .as_str()
+            .expect("captured ABI JSON should contain code_boc64"),
+        expected_code_boc64,
+        "TypeScript wrapper ABI must use code from the BoC source, not from the types file"
     );
 }
 
@@ -847,6 +1310,402 @@ fn test_wrapper_generation_with_typed_cell_param() {
 }
 
 #[test]
+fn test_wrapper_generation_imports_generic_message_field_types() {
+    let project = ProjectBuilder::new("wrapper_generic_fields")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "messages"
+
+                contract MyContract {
+                    incomingMessages: GenericPing
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/messages",
+            r#"
+                import "payloads"
+
+                struct (0x00000001) GenericPing {
+                    payload: Boxed<uint32>
+                }
+            "#,
+        )
+        .file(
+            "contracts/payloads",
+            r"
+                struct Boxed<T> {
+                    value: T
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_generic_message_field_types/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_imports_generic_external_message_field_types() {
+    let project = ProjectBuilder::new("wrapper_generic_external_fields")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "@stdlib/gas-payments"
+                import "messages"
+
+                contract MyContract {
+                    incomingExternal: GenericExtPing
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onExternalMessage() {
+                    acceptExternalMessage();
+                }
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/messages",
+            r#"
+                import "payloads"
+
+                struct (0xF3000001) GenericExtPing {
+                    payload: Boxed<uint32>
+                }
+            "#,
+        )
+        .file(
+            "contracts/payloads",
+            r"
+                struct Boxed<T> {
+                    value: T
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_generic_external_message_field_types/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_imports_generic_get_method_types() {
+    let project = ProjectBuilder::new("wrapper_generic_get_method")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "payloads"
+
+                contract MyContract {}
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+
+                get fun echo_boxed(payload: Boxed<uint32>): Boxed<uint32> {
+                    return { value: payload.value };
+                }
+            "#,
+        )
+        .file(
+            "contracts/payloads",
+            r"
+                struct Boxed<T> {
+                    value: T
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_generic_get_method_types/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_imports_both_storage_and_deployment_storage_types() {
+    let project = ProjectBuilder::new("wrapper_both_storage_types")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "deploy_storage"
+                import "runtime_storage"
+
+                contract MyContract {
+                    storage: RuntimeStorage
+                    storageAtDeployment: DeploymentStorage
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/deploy_storage",
+            r"
+                struct DeploymentStorage {
+                    seed: uint32
+                }
+            ",
+        )
+        .file(
+            "contracts/runtime_storage",
+            r"
+                struct RuntimeStorage {
+                    value: uint32
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_both_storage_and_deployment_storage_types/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_imports_generic_message_field_type_arguments() {
+    let project = ProjectBuilder::new("wrapper_generic_field_type_arguments")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "messages"
+
+                contract MyContract {
+                    incomingMessages: GenericPing
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/messages",
+            r#"
+                import "boxes"
+                import "payloads"
+
+                struct (0x00000001) GenericPing {
+                    payload: Boxed<PayloadData>
+                }
+            "#,
+        )
+        .file(
+            "contracts/boxes",
+            r"
+                struct Boxed<T> {
+                    value: T
+                }
+            ",
+        )
+        .file(
+            "contracts/payloads",
+            r"
+                struct PayloadData {
+                    value: uint32
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_generic_message_field_type_arguments/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_deduplicates_import_paths_collected_from_storage_messages_and_fields() {
+    let project = ProjectBuilder::new("wrapper_dedup_imports")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "types"
+
+                contract MyContract {
+                    storage: Storage
+                    incomingMessages: GenericPing
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/types",
+            r"
+                struct Storage {
+                    payload: Boxed<uint32>
+                }
+
+                struct Boxed<T> {
+                    value: T
+                }
+
+                struct (0x00000001) GenericPing {
+                    payload: Boxed<uint32>
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_deduplicates_import_paths_collected_from_storage_messages_and_fields/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
+fn test_wrapper_generation_imports_client_type_variants_from_message_fields() {
+    let project = ProjectBuilder::new("wrapper_client_type_imports")
+        .mapping("acton", ".acton")
+        .contract(
+            "my_contract",
+            r#"
+                import "messages"
+
+                contract MyContract {
+                    incomingMessages: ClientTypedPing
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/messages",
+            r#"
+                import "payloads"
+
+                type WirePayload = RemainingBitsAndRefs
+
+                struct (0x00000001) ClientTypedPing {
+                    @abi.clientType(PayloadInline | PayloadInRef)
+                    payload: WirePayload
+                }
+            "#,
+        )
+        .file(
+            "contracts/payloads",
+            r"
+                struct (0b0) PayloadInline {
+                    value: RemainingBitsAndRefs
+                }
+
+                struct (0b1) PayloadInRef {
+                    value: Cell<RemainingBitsAndRefs>
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("my_contract")
+        .generate_test_stub()
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("wrappers/MyContract.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_generation_imports_client_type_variants_from_message_fields/wrapper.tolk.txt",
+        );
+
+    project.acton().test().run().success().assert_passed(1);
+}
+
+#[test]
 fn test_wrapper_generation_with_snake_case_getters() {
     let project = ProjectBuilder::new("wrapper_getters")
         .contract(
@@ -944,6 +1803,48 @@ fn test_wrapper_output_dir_places_wrapper_in_directory() {
         test_code.contains("import \"../custom/MyContract.gen\""),
         "test stub should import wrapper from custom directory:\n{test_code}"
     );
+}
+
+#[test]
+fn test_wrapper_output_dir_skips_implicit_stdlib_common_import() {
+    let project = ProjectBuilder::new("wrapper_output_dir_stdlib_common")
+        .contract(
+            "config",
+            r#"
+                import "storage"
+
+                contract Config {
+                    storage: ConfigStorage
+                }
+
+                fun onInternalMessage(_: InMessage) {}
+                fun onBouncedMessage(_: InMessageBounced) {}
+            "#,
+        )
+        .file(
+            "contracts/storage",
+            r"
+                struct ConfigStorage {
+                    raw: dict
+                }
+            ",
+        )
+        .build();
+
+    project
+        .acton()
+        .wrapper("config")
+        .wrapper_output_dir("config/wrappers")
+        .run()
+        .success()
+        .assert_file_snapshot_matches(
+            project
+                .path()
+                .join("config/wrappers/Config.gen.tolk")
+                .to_str()
+                .expect(""),
+            "integration/snapshots/wrapper/test_wrapper_output_dir_skips_implicit_stdlib_common_import/wrapper.tolk.txt",
+        );
 }
 
 #[test]

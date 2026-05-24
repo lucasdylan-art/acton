@@ -1,8 +1,12 @@
+use super::SearchParamIndex;
 use crate::commands::common::error_fmt;
 use crate::context::{
-    AssertFailure, CompilationResult, Context, DebugStopRequested, GetMethodAssertFailure,
-    KnownAddress, MessageIterState, ParsedSearchParams, PendingMessageStep, SearchField, Wallet,
-    code_lookup_hash, compile_project_contract_with_cache, to_cell,
+    AssertFailure, CompilationResult, Context, DebugStopRequested, FailedSendMessageResult,
+    GetMethodAssertFailure, KnownAddress, MessageIterState, ParsedSearchParams, PendingMessageStep,
+    SearchField, Wallet, code_lookup_hash, compile_project_contract_with_cache, to_cell,
+};
+use crate::contract_interface::{
+    compile_optional_contract_interface, is_boc_path, read_precompiled_boc,
 };
 use crate::external_send::{SendBocContext, format_send_boc_error};
 use crate::paths;
@@ -24,7 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use tolk_compiler::SourceMap;
 use tolk_compiler::abi::ContractABI;
@@ -50,11 +54,20 @@ use tycho_types::models::{
     AccountState, AccountStatus, AccountStatusChange, ActionPhase, ComputePhase,
     ComputePhaseSkipReason, CurrencyCollection, ExtInMsgInfo, ExtOutMsgInfo,
     ExtraCurrencyCollection, HashUpdate, IntAddr, IntMsgInfo, LibDescr, Message, MsgInfo,
-    OptionalAccount, OrdinaryTxInfo, RelaxedMessage, RelaxedMsgInfo, ShardAccount,
-    SkippedComputePhase, StateInit, StdAddr, StdAddrFormat, StoragePhase, StorageUsedShort,
-    Transaction, TxInfo,
+    OptionalAccount, OrdinaryTxInfo, OutAction, OutActionsRevIter, RelaxedMessage, RelaxedMsgInfo,
+    ShardAccount, SkippedComputePhase, StateInit, StdAddr, StdAddrFormat, StoragePhase,
+    StorageUsedShort, Transaction, TxInfo,
 };
 use tycho_types::num::{Tokens, Uint15};
+
+// Keep in sync with `impl.treasuryCode()` in `lib/emulation/testing.tolk`.
+const TREASURY_CODE_BOC64: &str = "te6cckEBBAEARQABFP8A9KQT9LzyyAsBAgEgAwIAWvLT/+1E0NP/0RK68qL0BNH4AH+OFiGAEPR4b6UgmALTB9QwAfsAkTLiAbPmWwAE0jD+omUe";
+
+static TREASURY_CODE_HASH: LazyLock<HashBytes> = LazyLock::new(|| {
+    let code =
+        Boc::decode_base64(TREASURY_CODE_BOC64).expect("testing.treasury code BoC must be valid");
+    code_lookup_hash(&code)
+});
 
 /// Resolve the unix time to use for a get method invocation.
 ///
@@ -113,6 +126,38 @@ fn run_nested_executor_until_finished(
     Ok(())
 }
 
+fn missing_generated_dependency_message(error_message: &str, contract_id: &str) -> Option<String> {
+    if !error_message.contains("Failed to import:") || !error_message.contains("@gen/") {
+        return None;
+    }
+
+    let mut generated_import = error_message
+        .split("@gen/")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| c == '"' || c == '\'' || c.is_whitespace())
+                .next()
+        })
+        .map_or_else(
+            || "@gen/<dependency>.code".to_owned(),
+            |rest| format!("@gen/{rest}"),
+        );
+    if !generated_import.ends_with(".tolk") {
+        generated_import.push_str(".tolk");
+    }
+
+    Some(format!(
+        "Generated dependency helper {} is missing while compiling contract {}.\n\
+         Run {} or {} before {}, then retry.\n\n\
+         {error_message}",
+        generated_import.yellow(),
+        contract_id.yellow(),
+        format!("acton build {contract_id}").cyan(),
+        "acton build".cyan(),
+        "acton script".cyan(),
+    ))
+}
+
 extension!(build in (Context) with (path: String, id: String) using build_impl);
 fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> anyhow::Result<()> {
     debug!("Building {id}");
@@ -121,19 +166,21 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
     let name_only = path.is_empty();
     let mut path = PathBuf::from(&path);
     let mut display_name = id.clone(); // by default display name equal to ID
+    let contract_config = ctx.env.find_contract(&id);
 
     if name_only {
         // > build("JettonMinter")
         debug!("No path provided, search in contracts");
-        let found_contract = ctx.env.find_contract(&id);
 
-        let Some(found_contract) = found_contract else {
+        let Some(found_contract) = &contract_config else {
             anyhow::bail!(error_fmt::contract_not_found(ctx.env.config, &id));
         };
 
         debug!("Found contract with info: {found_contract:?}");
 
-        display_name = found_contract.display_name(&display_name).to_owned();
+        found_contract
+            .display_name(&id)
+            .clone_into(&mut display_name);
         path = found_contract.absolute_source_path(&ctx.env.project_root);
     } else if !path.is_absolute() {
         // > build("JettonMinter", "relative/to/root/path/to/contract")
@@ -154,16 +201,6 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
 
     let path_display = path.display().to_string();
 
-    if path_display.ends_with(".boc") {
-        // For BoC source we just return it as a Cell
-        let binary_data =
-            fs::read(&path).with_context(|| format!("Cannot read BoC file {path_display}"))?;
-        let cell = Boc::decode(binary_data.as_slice())
-            .with_context(|| anyhow::anyhow!("Failed to decode code BoC for {path_display}"))?;
-        stk.push(TupleItem::Cell(cell));
-        return Ok(());
-    }
-
     // Build cache is runtime only cache, if this contract was already built we just
     // return cached cell for the contract.
     if let Some(cached) = ctx.build.build_cache.built.get(&path) {
@@ -174,6 +211,52 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
             anyhow::anyhow!("Failed to decode cached code BoC for {path_display}")
         })?;
         stk.push(TupleItem::Cell(code_cell));
+        return Ok(());
+    }
+
+    if is_boc_path(&path) {
+        let binary_data =
+            fs::read(&path).with_context(|| format!("Cannot read BoC file {path_display}"))?;
+        let cell = Boc::decode(binary_data.as_slice())
+            .with_context(|| anyhow::anyhow!("Failed to decode code BoC for {path_display}"))?;
+
+        if !name_only {
+            // Explicit BoC paths are code-only and must stay independent of manifest metadata.
+            stk.push(TupleItem::Cell(cell));
+            return Ok(());
+        }
+
+        let code_boc64 = Boc::encode_base64(&cell);
+        let code_hash = *cell.repr_hash();
+
+        let interface = if let Some(contract_config) = &contract_config {
+            compile_optional_contract_interface(
+                ctx.env.config,
+                &ctx.env.project_root,
+                &id,
+                contract_config,
+            )?
+        } else {
+            None
+        };
+        let (source_map, abi) = match interface {
+            Some(interface) => (
+                Arc::new(interface.source_map),
+                Some(Arc::new(interface.abi)),
+            ),
+            None => (Arc::new(SourceMap::without_debug_info()), None),
+        };
+        ctx.build.build_cache.memoize(
+            &id,
+            &display_name,
+            &path,
+            &code_boc64,
+            code_hash,
+            source_map,
+            abi,
+        );
+
+        stk.push(TupleItem::Cell(cell));
         return Ok(());
     }
 
@@ -197,6 +280,7 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
         let source_map = Arc::new(cached_entry.source_map.clone().unwrap_or_default());
 
         ctx.build.build_cache.memoize(
+            &id,
             &display_name,
             &path,
             &cached_entry.code_boc64,
@@ -239,6 +323,7 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
             let source_map = Arc::new(success.source_map.unwrap_or_default());
 
             ctx.build.build_cache.memoize(
+                &id,
                 &display_name,
                 &path,
                 &success.code_boc64,
@@ -255,7 +340,9 @@ fn build_impl(ctx: &mut Context, stk: &mut Tuple, path: String, id: String) -> a
                 error.message
             );
 
-            anyhow::bail!("Compilation failed: {}", error.message);
+            let message =
+                missing_generated_dependency_message(&error.message, &id).unwrap_or(error.message);
+            anyhow::bail!("Compilation failed: {message}");
         }
     }
 
@@ -284,13 +371,60 @@ pub(crate) fn compilation_result_for_code(
     // match that cell against local project contracts so debug/backtrace and
     // formatter paths can still use their source maps or ABI.
     let target_hash = code_lookup_hash(&code);
+    if target_hash == *TREASURY_CODE_HASH {
+        return None;
+    }
 
     let contracts = &ctx.env.config.contracts.as_ref()?.contracts;
     for (contract_id, contract) in contracts {
         let path = contract.absolute_source_path(&ctx.env.project_root);
         let path_display = path.display().to_string();
-        if path_display.ends_with(".boc") {
-            continue;
+        if is_boc_path(&path) {
+            let precompiled = match read_precompiled_boc(&path, contract.src.as_str()) {
+                Ok(precompiled) => precompiled,
+                Err(err) => {
+                    warn!("Failed to read {path_display} while resolving debug source map: {err}");
+                    continue;
+                }
+            };
+
+            if precompiled.code_hash != target_hash {
+                continue;
+            }
+
+            let interface = match compile_optional_contract_interface(
+                ctx.env.config,
+                &ctx.env.project_root,
+                contract_id,
+                contract,
+            ) {
+                Ok(interface) => interface,
+                Err(err) => {
+                    warn!(
+                        "Failed to compile types for {path_display} while resolving debug source map: {err}"
+                    );
+                    continue;
+                }
+            };
+            let (source_map, abi) = match interface {
+                Some(interface) => (
+                    Arc::new(interface.source_map),
+                    Some(Arc::new(interface.abi)),
+                ),
+                None => (Arc::new(SourceMap::without_debug_info()), None),
+            };
+
+            return Some((
+                path,
+                CompilationResult {
+                    name: contract_id.clone(),
+                    display_name: contract.display_name(contract_id).to_owned(),
+                    code_boc64: precompiled.code_boc64,
+                    code_hash: precompiled.code_hash,
+                    source_map,
+                    abi,
+                },
+            ));
         }
 
         let result = match compile_project_contract_with_cache(
@@ -342,30 +476,7 @@ fn send_message_impl(
     };
 
     if is_external && ctx.can_broadcast_to_network() {
-        if ctx.env.tonconnect.is_some() {
-            anyhow::bail!(
-                "`net.sendExternal` cannot be used with {}; use `net.send(wallet.address, createMessage(...))` so the connected wallet can sign the internal message",
-                "--tonconnect".yellow()
-            );
-        }
-
-        let parsed_ext_in = msg
-            .parse::<Message<'_>>()
-            .context("Failed to parse external-in message cell")?;
-        let norm_hash = compute_normalized_ext_in_hash(&parsed_ext_in)?;
-        drop(parsed_ext_in);
-
-        let network = ctx.network();
-        let custom_networks = ctx.env.config.custom_networks();
-        let client = TonApiClient::new(network, custom_networks)
-            .context("Failed to initialize toncenter client for external-in broadcast")?;
-        client
-            .send_boc(&Boc::encode_base64(&msg))
-            .map_err(|error| format_send_boc_error(error, SendBocContext::Generic))?;
-
-        let pseudo_tx = build_pseudo_broadcast_tx(ctx.chain.world_state.get_now(), msg, norm_hash);
-        ctx.chain.world_state.invalidate_remote_cache();
-        stack.push(TupleItem::big_array_from_items(vec![pseudo_tx]));
+        stack.push(broadcast_external_message(ctx, msg)?);
         return Ok(());
     }
 
@@ -445,6 +556,133 @@ fn send_message_impl(
         .save_message(&ctx.env.running_id, emulations);
     stack.push(TupleItem::big_array_from_items(transaction_cells));
     Ok(())
+}
+
+extension!(send_external_message in (Context) with (msg: Cell) using send_external_message_impl);
+fn send_external_message_impl(
+    ctx: &mut Context,
+    stack: &mut Tuple,
+    msg: Cell,
+) -> anyhow::Result<()> {
+    let emulator = &ctx.chain.emulator;
+
+    if ctx.can_broadcast_to_network() {
+        stack.push(external_send_result_tuple(
+            broadcast_external_message(ctx, msg)?,
+            None,
+        ));
+        return Ok(());
+    }
+
+    let src = IntAddr::Std(StdAddr::new(-1, HashBytes::ZERO));
+    let libs = ctx.chain.build_libs(&src);
+    let world_state = &mut ctx.chain.world_state;
+
+    let emulations = if ctx.debug.is_enabled() {
+        send_message_debug(ctx, &msg, &libs, Some(src))
+    } else {
+        emulator.send_message(world_state, msg, &libs, Some(src))
+    }
+    .context("Cannot send external message")?;
+
+    let transaction_cells = emulations
+        .iter()
+        .filter_map(|emulation| match emulation {
+            SendMessageResult::Success(res) => Some(res),
+            SendMessageResult::Error(_) => None,
+        })
+        .filter_map(emulation_to_send_result)
+        .collect::<Vec<_>>();
+    let trace_index = ctx
+        .chain
+        .emulations
+        .save_message(&ctx.env.running_id, emulations);
+    let first_failed_message = ctx
+        .chain
+        .emulations
+        .results_of(&ctx.env.running_id)
+        .and_then(|emulations| emulations.failed_messages.get(trace_index))
+        .and_then(|failed_messages| failed_messages.first());
+    let error = if transaction_cells.is_empty() {
+        first_failed_message
+    } else {
+        None
+    };
+    let transactions = if error.is_some() {
+        TupleItem::Null
+    } else {
+        TupleItem::big_array_from_items(transaction_cells)
+    };
+
+    let result = external_send_result_tuple(transactions, error);
+    stack.push(result);
+    Ok(())
+}
+
+fn broadcast_external_message(ctx: &mut Context, msg: Cell) -> anyhow::Result<TupleItem> {
+    if ctx.env.tonconnect.is_some() {
+        anyhow::bail!(
+            "`net.sendExternal` cannot be used with {}; use `net.send(wallet.address, createMessage(...))` so the connected wallet can sign the internal message",
+            "--tonconnect".yellow()
+        );
+    }
+
+    let parsed_ext_in = msg
+        .parse::<Message<'_>>()
+        .context("Failed to parse external-in message cell")?;
+    let norm_hash = compute_normalized_ext_in_hash(&parsed_ext_in)?;
+    drop(parsed_ext_in);
+
+    let network = ctx.network();
+    let custom_networks = ctx.env.config.custom_networks();
+    let client = TonApiClient::new(network, custom_networks)
+        .context("Failed to initialize toncenter client for external-in broadcast")?;
+    client
+        .send_boc(&Boc::encode_base64(&msg))
+        .map_err(|error| format_send_boc_error(error, SendBocContext::Generic))?;
+
+    let pseudo_tx = build_pseudo_broadcast_tx(ctx.chain.world_state.get_now(), msg, norm_hash);
+    ctx.chain.world_state.invalidate_remote_cache();
+    Ok(TupleItem::big_array_from_items(vec![pseudo_tx]))
+}
+
+fn external_send_result_tuple(
+    transactions: TupleItem,
+    error: Option<&FailedSendMessageResult>,
+) -> TupleItem {
+    TupleItem::Tuple(Tuple(vec![
+        transactions,
+        error.map_or(TupleItem::Null, external_send_error_tuple),
+    ]))
+}
+
+fn external_send_error_tuple(error: &FailedSendMessageResult) -> TupleItem {
+    TupleItem::Tuple(Tuple(vec![
+        string_tuple_item(&error.error),
+        bool_tuple_item(error.external_not_accepted),
+        optional_int_tuple_item(error.vm_exit_code),
+        u64_tuple_item(error.diagnostic_id),
+    ]))
+}
+
+fn string_tuple_item(value: &str) -> TupleItem {
+    let mut tuple = Tuple::default();
+    tuple.push_string(value);
+    tuple.0.pop().expect("push_string must add one tuple item")
+}
+
+fn bool_tuple_item(value: bool) -> TupleItem {
+    let mut tuple = Tuple::default();
+    tuple.push_bool(value);
+    tuple.0.pop().expect("push_bool must add one tuple item")
+}
+
+fn u64_tuple_item(value: u64) -> TupleItem {
+    TupleItem::Int(BigInt::from(value))
+}
+
+fn optional_int_tuple_item(value: Option<i64>) -> TupleItem {
+    value.map_or(TupleItem::Null, |value| TupleItem::Int(BigInt::from(value)))
 }
 
 extension!(run_tick_tock in (Context) with (is_tock: BigInt, on_account: StdAddr) using run_tick_tock_impl);
@@ -733,6 +971,10 @@ fn compute_normalized_ext_in_hash(msg: &Message<'_>) -> anyhow::Result<HashBytes
 /// Only external-in is supported — the TON docs message-lookup flow is specified for
 /// messages sent to the network by the client, which are always external-in.
 fn ext_in_dest_address(msg_cell: &Cell) -> anyhow::Result<String> {
+    Ok(ext_in_dest_std_address(msg_cell)?.to_string())
+}
+
+fn ext_in_dest_std_address(msg_cell: &Cell) -> anyhow::Result<StdAddr> {
     let msg = msg_cell
         .parse::<Message<'_>>()
         .context("Failed to parse inbound message cell")?;
@@ -740,7 +982,7 @@ fn ext_in_dest_address(msg_cell: &Cell) -> anyhow::Result<String> {
         anyhow::bail!("waitForFirstTransaction expects an external-in message");
     };
     match &info.dst {
-        IntAddr::Std(addr) => Ok(addr.to_string()),
+        IntAddr::Std(addr) => Ok(addr.clone()),
         IntAddr::Var(_) => anyhow::bail!("Var addresses are not supported"),
     }
 }
@@ -814,6 +1056,47 @@ fn emulation_to_send_result(emulation: &SendMessageResultSuccess) -> Option<Tupl
         out_actions,
         &emulation.externals,
     ))
+}
+
+fn send_action_modes(result: &SendMessageResultSuccess) -> Vec<u32> {
+    let Some(actions_b64) = &result.actions else {
+        return Vec::new();
+    };
+    let Ok(actions_cell) = Boc::decode_base64(actions_b64.as_ref()) else {
+        return Vec::new();
+    };
+    let Ok(slice) = actions_cell.as_slice() else {
+        return Vec::new();
+    };
+
+    let mut modes = OutActionsRevIter::new(slice)
+        .filter_map(Result::ok)
+        .filter_map(|action| match action {
+            OutAction::SendMsg { mode, .. } => Some(u32::from(mode.bits())),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    modes.reverse();
+    modes
+}
+
+fn internal_child_send_modes(result: &SendMessageResultSuccess) -> Vec<u32> {
+    let mut modes = Vec::new();
+
+    for (out_msg, send_mode) in result
+        .transaction
+        .iter_out_msgs()
+        .zip(send_action_modes(result))
+    {
+        let Ok(out_msg) = out_msg else {
+            continue;
+        };
+        if let MsgInfo::Int(_) = out_msg.info {
+            modes.push(send_mode);
+        }
+    }
+
+    modes
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -939,6 +1222,10 @@ where
     let mut executed = 0usize;
     let mut matched = false;
     let mut results = Vec::new();
+    let track_child_send_modes = matches!(
+        &stop,
+        IterationStop::UntilMatch(predicates, _) if predicates.send_mode.is_some()
+    );
 
     loop {
         match &stop {
@@ -968,12 +1255,16 @@ where
             step.parent_transaction = pending.parent_lt;
             let tx_lt = step.transaction.lt;
             let mut externals = Vec::new();
+            let mut send_action_modes =
+                track_child_send_modes.then(|| send_action_modes(step).into_iter());
 
             let out_msgs = step
                 .transaction
                 .iter_out_msgs()
                 .zip(step.transaction.out_msgs.raw_values());
             for (out_msg, raw_out_msg) in out_msgs {
+                let send_mode = send_action_modes.as_mut().and_then(Iterator::next);
+
                 let Ok(out_msg) = out_msg else {
                     continue;
                 };
@@ -991,7 +1282,12 @@ where
                         let Ok(out_msg_cell) = raw_out_msg.load_reference_cloned() else {
                             continue;
                         };
-                        let _ = message_iters.push_child_message(cursor_id, out_msg_cell, tx_lt);
+                        let _ = message_iters.push_child_message(
+                            cursor_id,
+                            out_msg_cell,
+                            tx_lt,
+                            send_mode,
+                        );
                     }
                     MsgInfo::ExtIn(_) => {}
                 }
@@ -1000,7 +1296,12 @@ where
             step.externals = externals;
 
             if let IterationStop::UntilMatch(predicates, executor) = &stop
-                && transaction_matches_predicates(&step.transaction, predicates, executor)?
+                && transaction_matches_predicates(
+                    &step.transaction,
+                    pending.send_mode,
+                    predicates,
+                    executor,
+                )?
             {
                 matched = true;
             }
@@ -1032,23 +1333,35 @@ fn execute_message_iter_batch(
         anyhow::bail!("createTraceIterationCursor() is available only in emulation mode")
     }
 
-    if ctx.debug.is_enabled() {
-        anyhow::bail!("Step-by-step execution is not supported in debug mode yet")
-    }
-
-    let chain = &mut ctx.chain;
-    execute_message_iter_batch_with(
-        &mut ctx.message_iters,
+    let debug_enabled = ctx.debug.is_enabled();
+    let mut message_iters = std::mem::take(&mut ctx.message_iters);
+    let batch = execute_message_iter_batch_with(
+        &mut message_iters,
         cursor_id,
         stop,
         |pending, libs_owner| {
-            let libs = chain.build_libs_with_hash_owner(&libs_owner);
+            let libs = ctx.chain.build_libs_with_hash_owner(&libs_owner);
+            let message = pending.message;
+            let from = pending.from;
+
+            if debug_enabled {
+                let Some(result) = send_transaction_debug(ctx, &message, &libs, from)
+                    .context("Cannot execute step-by-step transaction")?
+                else {
+                    anyhow::bail!("Cannot execute step-by-step transaction");
+                };
+                return Ok(result);
+            }
+
+            let chain = &mut ctx.chain;
             chain
                 .emulator
-                .send_transaction(chain.world_state, pending.message, &libs, pending.from)
+                .send_transaction(chain.world_state, message, &libs, from)
                 .context("Cannot execute step-by-step transaction")
         },
-    )
+    );
+    ctx.message_iters = message_iters;
+    batch
 }
 
 /// Broadcast an internal message through an opened wallet. Returns the external-in cell
@@ -1283,10 +1596,6 @@ fn start_message_iter_impl(
         anyhow::bail!("createTraceIterationCursor() is available only in emulation mode")
     }
 
-    if ctx.debug.is_enabled() {
-        anyhow::bail!("Step-by-step execution is not supported in debug mode yet")
-    }
-
     let std_address = src.as_std().context("Var addresses are not supported")?;
     let libs_owner = std_address.address;
     let cursor_id = ctx
@@ -1489,9 +1798,8 @@ fn call_predicate(executor: &GetExecutor, cont: &ContData, arg: TupleItem) -> an
 /// Parse `SearchParams` tuple into `ParsedSearchParams`.
 /// Each field is a sub-tuple [tag, value] where tag: 0=null, 1=user predicate, 2=value-as-predicate.
 fn parse_search_params_tuple(params: &Tuple) -> ParsedSearchParams {
-    let extract_field = |idx_from_end: usize| -> Option<SearchField> {
-        let idx = params.0.len().checked_sub(idx_from_end + 1)?;
-        let item = params.0.get(idx)?;
+    let extract_field = |idx: SearchParamIndex| -> Option<SearchField> {
+        let item = params.0.get(idx.as_usize())?;
         let TupleItem::Tuple(sub) = item else {
             return None;
         };
@@ -1516,20 +1824,21 @@ fn parse_search_params_tuple(params: &Tuple) -> ParsedSearchParams {
     };
 
     ParsedSearchParams {
-        state_init: extract_field(0),
-        body: extract_field(1),
-        compute_phase_skipped: extract_field(2),
-        action_exit_code: extract_field(3),
-        opcode: extract_field(4),
-        bounced: extract_field(5),
-        bounce: extract_field(6),
-        deploy: extract_field(7),
-        aborted: extract_field(8),
-        success: extract_field(9),
-        exit_code: extract_field(10),
-        value: extract_field(11),
-        from: extract_field(12),
-        to: extract_field(13),
+        to: extract_field(SearchParamIndex::To),
+        from: extract_field(SearchParamIndex::From),
+        value: extract_field(SearchParamIndex::Value),
+        exit_code: extract_field(SearchParamIndex::ExitCode),
+        success: extract_field(SearchParamIndex::Success),
+        aborted: extract_field(SearchParamIndex::Aborted),
+        deploy: extract_field(SearchParamIndex::Deploy),
+        bounce: extract_field(SearchParamIndex::Bounce),
+        bounced: extract_field(SearchParamIndex::Bounced),
+        opcode: extract_field(SearchParamIndex::Opcode),
+        action_exit_code: extract_field(SearchParamIndex::ActionExitCode),
+        compute_phase_skipped: extract_field(SearchParamIndex::ComputePhaseSkipped),
+        body: extract_field(SearchParamIndex::Body),
+        state_init: extract_field(SearchParamIndex::StateInit),
+        send_mode: extract_field(SearchParamIndex::SendMode),
     }
 }
 
@@ -1546,6 +1855,7 @@ struct ScalarSearchParams {
     bounced: Option<bool>,
     opcode: Option<u32>,
     action_exit_code: Option<i32>,
+    send_mode: Option<u32>,
     compute_phase_skipped: Option<bool>,
     body: Option<Cell>,
     state_init: Option<Option<StateInit>>,
@@ -1595,127 +1905,77 @@ fn read_optional_address_param(item: Option<&TupleItem>) -> Option<Option<IntAdd
     }
 }
 
+fn read_optional_u32_param(item: Option<&TupleItem>) -> Option<u32> {
+    match item {
+        Some(TupleItem::Null) | None => None,
+        Some(item) => read_int_like_param(item).and_then(ToPrimitive::to_u32),
+    }
+}
+
+fn read_optional_i32_param(item: Option<&TupleItem>) -> Option<i32> {
+    match item {
+        Some(TupleItem::Null) | None => None,
+        Some(item) => read_int_like_param(item).map(|num| num.to_i32().unwrap_or(0)),
+    }
+}
+
+fn read_optional_bool_param(item: Option<&TupleItem>) -> Option<bool> {
+    match item {
+        Some(TupleItem::Null) | None => None,
+        Some(item) => read_bool_like_param(item),
+    }
+}
+
+fn read_optional_bigint_param(item: Option<&TupleItem>) -> Option<BigInt> {
+    let Some(TupleItem::Int(num)) = item else {
+        return None;
+    };
+    Some(num.clone())
+}
+
+fn read_optional_cell_param(item: Option<&TupleItem>) -> Option<Cell> {
+    let Some(TupleItem::Cell(cell)) = item else {
+        return None;
+    };
+    Some(cell.clone())
+}
+
+fn read_optional_state_init_param(item: Option<&TupleItem>) -> Option<Option<Option<StateInit>>> {
+    let Some(TupleItem::Cell(cell)) = item else {
+        return Some(None);
+    };
+    Some(Some(cell.parse::<Option<StateInit>>().ok()?))
+}
+
 fn parse_scalar_search_params_tuple(params: &Tuple) -> Option<ScalarSearchParams> {
-    let item_from_end = |idx_from_end: usize| {
-        params
-            .0
-            .len()
-            .checked_sub(idx_from_end + 1)
-            .and_then(|idx| params.0.get(idx))
-    };
-    let raw_state_init = item_from_end(0);
-    let raw_body = item_from_end(1);
-    let raw_compute_phase_skipped = item_from_end(2);
-    let raw_action_exit_code = item_from_end(3);
-    let raw_opcode = item_from_end(4);
-    let raw_bounced = item_from_end(5);
-    let raw_bounce = item_from_end(6);
-    let raw_deploy = item_from_end(7);
-    let raw_aborted = item_from_end(8);
-    let raw_success = item_from_end(9);
-    let raw_exit_code = item_from_end(10);
-    let raw_msg_value = item_from_end(11);
-    let raw_from = item_from_end(12);
-    let raw_to = item_from_end(13);
+    let item_at = |idx: SearchParamIndex| params.0.get(idx.as_usize());
 
-    let mut params = ScalarSearchParams {
-        to: read_optional_address_param(raw_to)?,
-        from: read_optional_address_param(raw_from)?,
-        ..Default::default()
-    };
-
-    if let Some(raw_opcode) = raw_opcode {
-        if raw_opcode == &TupleItem::Null {
-            params.opcode = None;
-        } else if let Some(num) = read_int_like_param(raw_opcode) {
-            params.opcode = num.to_u32();
-        }
-    }
-    if let Some(raw_bounced) = raw_bounced {
-        if raw_bounced == &TupleItem::Null {
-            params.bounced = None;
-        } else if let Some(value) = read_bool_like_param(raw_bounced) {
-            params.bounced = Some(value);
-        }
-    }
-    if let Some(raw_bounce) = raw_bounce {
-        if raw_bounce == &TupleItem::Null {
-            params.bounce = None;
-        } else if let Some(value) = read_bool_like_param(raw_bounce) {
-            params.bounce = Some(value);
-        }
-    }
-    if let Some(raw_deploy) = raw_deploy {
-        if raw_deploy == &TupleItem::Null {
-            params.deploy = None;
-        } else if let Some(value) = read_bool_like_param(raw_deploy) {
-            params.deploy = Some(value);
-        }
-    }
-    if let Some(raw_exit_code) = raw_exit_code {
-        if raw_exit_code == &TupleItem::Null {
-            params.exit_code = None;
-        } else if let Some(num) = read_int_like_param(raw_exit_code) {
-            params.exit_code = num.to_u32();
-        }
-    }
-    if let Some(raw_success) = raw_success {
-        if raw_success == &TupleItem::Null {
-            params.success = None;
-        } else if let Some(value) = read_bool_like_param(raw_success) {
-            params.success = Some(value);
-        }
-    }
-    if let Some(raw_aborted) = raw_aborted {
-        if raw_aborted == &TupleItem::Null {
-            params.aborted = None;
-        } else if let Some(value) = read_bool_like_param(raw_aborted) {
-            params.aborted = Some(value);
-        }
-    }
-    if let Some(raw_msg_value) = raw_msg_value {
-        if raw_msg_value == &TupleItem::Null {
-            params.value = None;
-        } else if let TupleItem::Int(num) = raw_msg_value {
-            params.value = Some(num.clone());
-        }
-    }
-    if let Some(raw_action_exit_code) = raw_action_exit_code {
-        if raw_action_exit_code == &TupleItem::Null {
-            params.action_exit_code = None;
-        } else if let Some(num) = read_int_like_param(raw_action_exit_code) {
-            params.action_exit_code = Some(num.to_i32().unwrap_or(0));
-        }
-    }
-    if let Some(raw_compute_phase_skipped) = raw_compute_phase_skipped {
-        if raw_compute_phase_skipped == &TupleItem::Null {
-            params.compute_phase_skipped = None;
-        } else if let Some(value) = read_bool_like_param(raw_compute_phase_skipped) {
-            params.compute_phase_skipped = Some(value);
-        }
-    }
-    if let Some(raw_body) = raw_body {
-        if raw_body == &TupleItem::Null {
-            params.body = None;
-        } else if let TupleItem::Cell(cell) = raw_body {
-            params.body = Some(cell.clone());
-        }
-    }
-    if let Some(raw_state_init) = raw_state_init {
-        if raw_state_init == &TupleItem::Null {
-            params.state_init = None;
-        } else if let TupleItem::Cell(cell) = raw_state_init {
-            params.state_init = Some(cell.parse::<Option<StateInit>>().ok()?);
-        }
-    }
-
-    Some(params)
+    Some(ScalarSearchParams {
+        to: read_optional_address_param(item_at(SearchParamIndex::To))?,
+        from: read_optional_address_param(item_at(SearchParamIndex::From))?,
+        value: read_optional_bigint_param(item_at(SearchParamIndex::Value)),
+        exit_code: read_optional_u32_param(item_at(SearchParamIndex::ExitCode)),
+        success: read_optional_bool_param(item_at(SearchParamIndex::Success)),
+        aborted: read_optional_bool_param(item_at(SearchParamIndex::Aborted)),
+        deploy: read_optional_bool_param(item_at(SearchParamIndex::Deploy)),
+        bounce: read_optional_bool_param(item_at(SearchParamIndex::Bounce)),
+        bounced: read_optional_bool_param(item_at(SearchParamIndex::Bounced)),
+        opcode: read_optional_u32_param(item_at(SearchParamIndex::Opcode)),
+        action_exit_code: read_optional_i32_param(item_at(SearchParamIndex::ActionExitCode)),
+        compute_phase_skipped: read_optional_bool_param(item_at(
+            SearchParamIndex::ComputePhaseSkipped,
+        )),
+        body: read_optional_cell_param(item_at(SearchParamIndex::Body)),
+        state_init: read_optional_state_init_param(item_at(SearchParamIndex::StateInit))?,
+        send_mode: read_optional_u32_param(item_at(SearchParamIndex::SendMode)),
+    })
 }
 
 /// Check if a transaction matches all predicate search params by calling each predicate via `run_continuation`.
 #[allow(clippy::collapsible_if)]
 fn transaction_matches_predicates(
     tx: &Transaction,
+    send_mode: Option<u32>,
     predicates: &ParsedSearchParams,
     executor: &GetExecutor,
 ) -> anyhow::Result<bool> {
@@ -1742,6 +2002,14 @@ fn transaction_matches_predicates(
     let requires_in_msg = requires_internal_in_msg || predicates.state_init.is_some();
 
     check!(predicates.deploy, bool_item(transaction_is_deploy(tx)));
+    if let Some(ref field) = predicates.send_mode {
+        let Some(send_mode) = send_mode else {
+            return Ok(false);
+        };
+        if !call_predicate(executor, &field.predicate, int_item(i64::from(send_mode)))? {
+            return Ok(false);
+        }
+    }
 
     let in_msg = tx.load_in_msg();
     if let Ok(Some(in_msg)) = &in_msg {
@@ -1837,7 +2105,11 @@ fn transaction_matches_predicates(
 }
 
 #[allow(clippy::collapsible_if)]
-fn transaction_matches_scalar_params(tx: &Transaction, params: &ScalarSearchParams) -> bool {
+fn transaction_matches_scalar_params(
+    tx: &Transaction,
+    send_mode: Option<u32>,
+    params: &ScalarSearchParams,
+) -> bool {
     let requires_internal_in_msg = params.opcode.is_some()
         || params.bounced.is_some()
         || params.bounce.is_some()
@@ -1851,6 +2123,12 @@ fn transaction_matches_scalar_params(tx: &Transaction, params: &ScalarSearchPara
         if expected_deploy != transaction_is_deploy(tx) {
             return false;
         }
+    }
+
+    if let Some(expected_send_mode) = params.send_mode
+        && send_mode != Some(expected_send_mode)
+    {
+        return false;
     }
 
     let in_msg = tx.load_in_msg();
@@ -2042,18 +2320,51 @@ fn find_saved_trace_segment_by_tx_lt_range<'a>(
     )
 }
 
+fn find_saved_tx_by_lt<'a>(ctx: &'a Context<'_>, lt: u64) -> Option<&'a SendMessageResultSuccess> {
+    ctx.chain
+        .emulations
+        .results_of(&ctx.env.running_id)?
+        .messages
+        .iter()
+        .flatten()
+        .find(|result| result.transaction.lt == lt)
+}
+
+fn saved_transaction_send_mode(
+    ctx: &Context<'_>,
+    result: &SendMessageResultSuccess,
+    send_modes_by_parent: &mut HashMap<u64, Vec<u32>>,
+) -> Option<u32> {
+    let parent_lt = result.parent_transaction?;
+    let parent = find_saved_tx_by_lt(ctx, parent_lt)?;
+    let child_index = parent
+        .child_transactions
+        .iter()
+        .position(|lt| *lt == result.transaction.lt)?;
+    send_modes_by_parent
+        .entry(parent_lt)
+        .or_insert_with(|| internal_child_send_modes(parent))
+        .get(child_index)
+        .copied()
+}
+
 fn find_transaction_in_saved_trace(
     ctx: &Context<'_>,
     first_tx_lt: u64,
     last_tx_lt: u64,
-    mut matches: impl FnMut(&Transaction) -> anyhow::Result<bool>,
+    needs_send_mode: bool,
+    mut matches: impl FnMut(&Transaction, Option<u32>) -> anyhow::Result<bool>,
 ) -> anyhow::Result<Option<Cell>> {
     let Some(trace) = find_saved_trace_segment_by_tx_lt_range(ctx, first_tx_lt, last_tx_lt) else {
         return Ok(None);
     };
+    let mut send_modes_by_parent = needs_send_mode.then(HashMap::<u64, Vec<u32>>::new);
 
     for result in trace {
-        if matches(&result.transaction)? {
+        let send_mode = send_modes_by_parent
+            .as_mut()
+            .and_then(|cache| saved_transaction_send_mode(ctx, result, cache));
+        if matches(&result.transaction, send_mode)? {
             return Ok(Some(to_cell(&result.transaction)));
         }
     }
@@ -2079,9 +2390,13 @@ fn find_transaction_by_params_impl(
         return Ok(());
     };
 
-    match find_transaction_in_saved_trace(ctx, first_tx_lt, last_tx_lt, |tx| {
-        Ok(transaction_matches_scalar_params(tx, &params))
-    })? {
+    match find_transaction_in_saved_trace(
+        ctx,
+        first_tx_lt,
+        last_tx_lt,
+        params.send_mode.is_some(),
+        |tx, send_mode| Ok(transaction_matches_scalar_params(tx, send_mode, &params)),
+    )? {
         Some(cell) => stack.push(TupleItem::Cell(cell)),
         None => stack.push(TupleItem::Null),
     }
@@ -2104,9 +2419,13 @@ fn find_transaction_by_predicate_params_impl(
     let predicates = parse_search_params_tuple(&params);
     let executor = make_predicate_executor(ctx)?;
 
-    match find_transaction_in_saved_trace(ctx, first_tx_lt, last_tx_lt, |tx| {
-        transaction_matches_predicates(tx, &predicates, &executor)
-    })? {
+    match find_transaction_in_saved_trace(
+        ctx,
+        first_tx_lt,
+        last_tx_lt,
+        predicates.send_mode.is_some(),
+        |tx, send_mode| transaction_matches_predicates(tx, send_mode, &predicates, &executor),
+    )? {
         Some(cell) => stack.push(TupleItem::Cell(cell)),
         None => stack.push(TupleItem::Null),
     }
@@ -2182,9 +2501,14 @@ fn run_get_method_impl(
         .map(|t| Boc::encode_base64(&t))
         .context("Cannot serialize tuple")?;
 
+    let mut missing_libraries_ctx = MissingLibrariesContext::default();
+
     let result = if ctx.debug.is_enabled() {
-        let step_executor = StepGetExecutor::new(&args_b64, &params, Some(&config_b64))
+        let mut step_executor = StepGetExecutor::new(&args_b64, &params, Some(&config_b64))
             .context("Cannot create get executor")?;
+        step_executor
+            .register_missing_library_callback(&mut missing_libraries_ctx, missing_library_callback)
+            .context("Cannot register missing library callback")?;
         step_executor
             .prepare(method_id, &args_b64)
             .context("Cannot prepare get method")?;
@@ -2231,11 +2555,26 @@ fn run_get_method_impl(
 
         result
     } else {
-        let executor = GetExecutor::new(&params).context("Cannot create get executor")?;
+        let mut executor = GetExecutor::new(&params).context("Cannot create get executor")?;
+        executor
+            .register_missing_library_callback(&mut missing_libraries_ctx, missing_library_callback)
+            .context("Cannot register missing library callback")?;
         executor
             .run_get_method(&args_b64, &params, Some(&config_b64))
             .context("Cannot run get method")?
     };
+
+    let mut missing_libraries = match &result {
+        GetMethodResult::Success(result) => result
+            .missing_library
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>(),
+        GetMethodResult::Error(_) => HashSet::new(),
+    };
+    missing_libraries.extend(missing_libraries_ctx.into_set());
+    let mut missing_libraries = missing_libraries.into_iter().collect::<Vec<_>>();
+    missing_libraries.sort_unstable();
 
     match result {
         GetMethodResult::Success(result) => {
@@ -2283,6 +2622,7 @@ fn run_get_method_impl(
                         vm_exit_code: result.vm_exit_code,
                         suggested_name,
                         vm_log: result.vm_log,
+                        missing_libraries,
                         source_map,
                         abi: abi.clone(),
                         caller_trace: None,
@@ -2461,6 +2801,18 @@ fn parse_cell_from_hex_impl(
 ) -> anyhow::Result<()> {
     let cell = Boc::decode_hex(cell_hex.trim())
         .with_context(|| format!("Failed to decode cell hex {cell_hex}"))?;
+    stack.push(TupleItem::Cell(cell));
+    Ok(())
+}
+
+extension!(parse_cell_from_base64 in (Context) with (cell_base64: String) using parse_cell_from_base64_impl);
+fn parse_cell_from_base64_impl(
+    _: &mut Context,
+    stack: &mut Tuple,
+    cell_base64: String,
+) -> anyhow::Result<()> {
+    let cell = Boc::decode_base64(cell_base64.trim())
+        .with_context(|| format!("Failed to decode cell base64 {cell_base64}"))?;
     stack.push(TupleItem::Cell(cell));
     Ok(())
 }
@@ -2849,7 +3201,7 @@ fn register_localnet_abis(
         return Ok(());
     }
 
-    let url = localnet_admin_url(custom_networks, "compiler-abis")?;
+    let url = localnet_acton_url(custom_networks, "acton_registerCompilerAbis")?;
     let payload = RegisterAbiPayload {
         entries: entries_by_hash
             .into_iter()
@@ -2890,21 +3242,21 @@ fn register_localnet_abis(
     Ok(())
 }
 
-fn localnet_admin_url(
+fn localnet_acton_url(
     custom_networks: &HashMap<String, acton_config::config::CustomNetworkUrls>,
     endpoint: &str,
 ) -> anyhow::Result<String> {
     let v2_url = Network::Localnet.toncenter_v2_url(custom_networks)?;
     let mut url = reqwest::Url::parse(&v2_url)?;
     let base_path = url.path().trim_end_matches('/');
-    let admin_base = base_path.strip_suffix("/api/v2").unwrap_or(base_path);
-    let admin_path = if admin_base.is_empty() {
-        format!("/admin/{endpoint}")
+    let acton_base = base_path.strip_suffix("/api/v2").unwrap_or(base_path);
+    let acton_path = if acton_base.is_empty() {
+        format!("/{endpoint}")
     } else {
-        format!("{admin_base}/admin/{endpoint}")
+        format!("{acton_base}/{endpoint}")
     };
 
-    url.set_path(&admin_path);
+    url.set_path(&acton_path);
     url.set_query(None);
     url.set_fragment(None);
     Ok(url.to_string())
@@ -3219,6 +3571,8 @@ pub fn register_extensions<T: BaseExecutor>(executor: &mut T, ctx: &mut Context)
         47 => parse_int : 1,
         48 => find_transaction_by_predicate_params : 3,
         49 => wait_for_trace : 4,
+        56 => send_external_message : 1,
+        57 => parse_cell_from_base64 : 1,
         501 => call_tolk_function : 3,
     });
 }
@@ -3233,6 +3587,22 @@ mod tests {
 
     fn test_hash(byte: u8) -> HashBytes {
         HashBytes([byte; 32])
+    }
+
+    #[test]
+    fn treasury_code_hash_is_recognized() {
+        let code = Boc::decode_base64(TREASURY_CODE_BOC64).expect("treasury code must decode");
+
+        assert_eq!(code_lookup_hash(&code), *TREASURY_CODE_HASH);
+    }
+
+    #[test]
+    fn non_treasury_code_hash_is_not_recognized() {
+        let mut builder = CellBuilder::new();
+        builder.store_uint(0xcafe, 16).expect("bits must fit");
+        let code = builder.build().expect("cell must build");
+
+        assert_ne!(code_lookup_hash(&code), *TREASURY_CODE_HASH);
     }
 
     fn test_transaction(lt: u64) -> Transaction {
@@ -3294,6 +3664,7 @@ mod tests {
     fn test_error(message: &str) -> SendMessageResult {
         SendMessageResult::Error(ton_executor::message::RunTransactionResultError {
             error: message.to_string(),
+            external_not_accepted: false,
             vm_log: None,
             vm_exit_code: None,
             executor_logs: None,
@@ -3318,7 +3689,7 @@ mod tests {
     #[test]
     fn configured_network_transaction_link_prefers_explorer_url() {
         let urls = acton_config::config::CustomNetworkUrls {
-            v2_url: Arc::from("http://localhost:3010/api/v2"),
+            v2_url: Arc::from("http://127.0.0.1:3010/api/v2"),
             v3_url: None,
             explorer_url: Some(Arc::from("https://explorer.example/explorer")),
         };
@@ -3331,7 +3702,7 @@ mod tests {
     #[test]
     fn configured_network_transaction_link_keeps_existing_tx_suffix() {
         let urls = acton_config::config::CustomNetworkUrls {
-            v2_url: Arc::from("http://localhost:3010/api/v2"),
+            v2_url: Arc::from("http://127.0.0.1:3010/api/v2"),
             v3_url: None,
             explorer_url: Some(Arc::from("https://explorer.example/explorer/tx/")),
         };
@@ -3344,27 +3715,27 @@ mod tests {
     #[test]
     fn configured_network_transaction_link_appends_tx_for_host_only_explorer() {
         let urls = acton_config::config::CustomNetworkUrls {
-            v2_url: Arc::from("http://localhost:3010/api/v2"),
+            v2_url: Arc::from("http://127.0.0.1:3010/api/v2"),
             v3_url: None,
-            explorer_url: Some(Arc::from("http://localhost:3006")),
+            explorer_url: Some(Arc::from("http://127.0.0.1:3006")),
         };
 
         let url = configured_network_transaction_link(&urls, "abc123")
             .expect("explorer link should be built");
-        assert_eq!(url, "http://localhost:3006/tx/abc123");
+        assert_eq!(url, "http://127.0.0.1:3006/tx/abc123");
     }
 
     #[test]
     fn configured_network_transaction_link_falls_back_to_v2() {
         let urls = acton_config::config::CustomNetworkUrls {
-            v2_url: Arc::from("http://localhost:3010/api/v2"),
+            v2_url: Arc::from("http://127.0.0.1:3010/api/v2"),
             v3_url: None,
             explorer_url: None,
         };
 
         let url = configured_network_transaction_link(&urls, "abc123")
             .expect("fallback link should be built");
-        assert_eq!(url, "http://localhost:3010/explorer/tx/abc123");
+        assert_eq!(url, "http://127.0.0.1:3010/explorer/tx/abc123");
     }
 
     #[test]
@@ -3375,10 +3746,10 @@ mod tests {
             .advance(cursor_id)
             .expect("root step must be consumed");
         message_iters
-            .push_child_message(cursor_id, Cell::default(), 100)
+            .push_child_message(cursor_id, Cell::default(), 100, None)
             .expect("first child must be queued");
         message_iters
-            .push_child_message(cursor_id, Cell::default(), 100)
+            .push_child_message(cursor_id, Cell::default(), 100, None)
             .expect("second child must be queued");
 
         let mut calls = 0usize;
@@ -3413,10 +3784,10 @@ mod tests {
             .expect("root step must be consumed");
         let second_child = Cell::default();
         message_iters
-            .push_child_message(cursor_id, Cell::default(), 200)
+            .push_child_message(cursor_id, Cell::default(), 200, None)
             .expect("first child must be queued");
         message_iters
-            .push_child_message(cursor_id, second_child.clone(), 200)
+            .push_child_message(cursor_id, second_child.clone(), 200, None)
             .expect("second child must be queued");
 
         let mut calls = 0usize;

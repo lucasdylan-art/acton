@@ -898,10 +898,25 @@ enum Commands {
         after_help = detailed_help_pointer("fmt")
     )]
     Fmt {
-        #[arg(help = "Files or directories to format (defaults to project root)", add = ArgValueCompleter::new(PathCompleter::any()))]
+        #[arg(
+            help = "Files or directories to format (defaults to project root)",
+            conflicts_with = "stdin",
+            add = ArgValueCompleter::new(PathCompleter::any())
+        )]
         paths: Vec<String>,
         #[arg(long, help = "Check if files are formatted without overwriting them")]
         check: bool,
+        #[arg(
+            long,
+            help = "Read Tolk source from stdin and write formatted source to stdout"
+        )]
+        stdin: bool,
+        #[arg(
+            long,
+            value_name = "PATH",
+            help = "Virtual file path to show in stdin diagnostics"
+        )]
+        stdin_filepath: Option<String>,
         #[arg(
             long,
             value_name = "startLine:startChar-endLine:endChar",
@@ -1095,6 +1110,17 @@ pub enum LocalnetCommand {
             help = "Localnet server port (default: [localnet].port or 5411)"
         )]
         port: Option<u16>,
+    },
+    #[command(about = "Inspect localnet status")]
+    Status {
+        #[arg(
+            long,
+            short,
+            help = "Localnet server port (default: [localnet].port or 5411)"
+        )]
+        port: Option<u16>,
+        #[arg(long, help = "Print machine-readable JSON")]
+        json: bool,
     },
 }
 
@@ -1907,13 +1933,7 @@ fn main() {
                     fail_on_diff,
                     fork_net,
                     fork_block_number,
-                    save_test_trace.or_else(|| {
-                        if ui {
-                            Some(paths::DEFAULT_BUILD_TRACES_DIR.to_owned())
-                        } else {
-                            None
-                        }
-                    }),
+                    save_test_trace,
                     mutate,
                     mutate_overrides,
                     mutate_contract,
@@ -2214,8 +2234,10 @@ fn main() {
         Commands::Fmt {
             paths,
             check,
+            stdin,
+            stdin_filepath,
             range,
-        } => fmt_cmd(paths, check, range),
+        } => fmt_cmd(paths, check, stdin, stdin_filepath, range),
         Commands::Doc { command } => match command {
             DocCommand::Tvm {
                 instruction,
@@ -2256,7 +2278,11 @@ fn main() {
         Commands::Meta { command } => match command {
             MetaCommand::GetSchema { schema } => print_schema_cmd(schema),
         },
-        Commands::Docgen { output, check } => docgen_cmd(output, check),
+        Commands::Docgen { output, check } => {
+            let mut cli_command = base_cli_command();
+            cli_command.build();
+            docgen_cmd(output, check, &cli_command)
+        }
         Commands::Ls {
             port,
             stdio,
@@ -2320,6 +2346,14 @@ fn main() {
                     commands::localnet::localnet_airdrop_cmd(&address, amount, port).await
                 })
             }
+            LocalnetCommand::Status { port, json } => {
+                let port = resolve_localnet_port(port);
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("Failed to build tokio runtime");
+                rt.block_on(async { commands::localnet::localnet_status_cmd(port, json).await })
+            }
         },
     };
 
@@ -2372,16 +2406,22 @@ fn validate_project_toolchain_version() -> anyhow::Result<()> {
     }
 
     let installed = acton::build_info::SHORT_VERSION;
-    if expected == installed {
-        return Ok(());
-    }
-    if acton::build_info::is_trunk_build() && expected == acton::build_info::PACKAGE_VERSION {
+    if toolchain_acton_version_matches(expected, installed) {
         return Ok(());
     }
 
     anyhow::bail!(
         "Acton CLI version mismatch for this project.\n\nActon.toml expects [toolchain].acton = \"{expected}\"\nInstalled acton version is \"{installed}\".\n\nInstall the expected version:\n  acton up {expected}\n\nOr update [toolchain].acton if this project supports acton {installed}."
     );
+}
+
+fn toolchain_acton_version_matches(expected: &str, installed: &str) -> bool {
+    if expected == installed {
+        return true;
+    }
+
+    acton::build_info::is_trunk_build()
+        && (expected == acton::build_info::PACKAGE_VERSION || expected == "trunk")
 }
 
 fn print_error(err: &anyhow::Error) {
@@ -2670,11 +2710,12 @@ fn create_test_config(
         }
         config.mutation_session_id = mutation_session_id;
         config.mutation_workers = mutation_workers;
+        apply_ui_trace_default(&mut config);
         validate_merged_test_fork_network(Some(acton_config), config.fork_net.as_ref())?;
         return Ok(config);
     }
 
-    let config = TestConfig {
+    let mut config = TestConfig {
         show_bodies,
         verbosity,
         debug,
@@ -2718,10 +2759,17 @@ fn create_test_config(
         ui_port: ui_port.unwrap_or(12344),
         fork_net,
     };
+    apply_ui_trace_default(&mut config);
 
     validate_merged_test_fork_network(acton_config.as_ref().ok(), config.fork_net.as_ref())?;
 
     Ok(config)
+}
+
+fn apply_ui_trace_default(config: &mut TestConfig) {
+    if config.ui && config.save_test_trace.is_none() {
+        config.save_test_trace = Some(paths::DEFAULT_BUILD_TRACES_DIR.to_owned());
+    }
 }
 
 fn validate_test_settings(test_settings: &TestSettings) -> anyhow::Result<()> {
@@ -2832,4 +2880,106 @@ fn parse_minimum_percent(raw: &str, kind: &str, flag: &str) -> Result<f64, Strin
     }
 
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_settings_to_config_with_ui_trace_default(
+        settings: &TestSettings,
+        save_test_trace_override: Option<&str>,
+        ui_override: bool,
+    ) -> TestConfig {
+        let mut config = settings.to_test_config(
+            None,
+            Vec::new(),
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            None,
+            save_test_trace_override.map(str::to_owned),
+            false,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            ui_override,
+            None,
+        );
+        apply_ui_trace_default(&mut config);
+        config
+    }
+
+    #[test]
+    fn ui_from_test_settings_enables_default_trace_dir() {
+        let settings = TestSettings {
+            ui: Some(true),
+            ..TestSettings::default()
+        };
+
+        let config = test_settings_to_config_with_ui_trace_default(&settings, None, false);
+
+        assert!(config.ui);
+        assert_eq!(
+            config.save_test_trace.as_deref(),
+            Some(paths::DEFAULT_BUILD_TRACES_DIR)
+        );
+    }
+
+    #[test]
+    fn cli_ui_flag_enables_default_trace_dir_without_config_ui() {
+        let config =
+            test_settings_to_config_with_ui_trace_default(&TestSettings::default(), None, true);
+
+        assert!(config.ui);
+        assert_eq!(
+            config.save_test_trace.as_deref(),
+            Some(paths::DEFAULT_BUILD_TRACES_DIR)
+        );
+    }
+
+    #[test]
+    fn explicit_trace_dir_is_preserved_when_ui_is_enabled() {
+        let settings = TestSettings {
+            ui: Some(true),
+            ..TestSettings::default()
+        };
+
+        let config =
+            test_settings_to_config_with_ui_trace_default(&settings, Some("custom-traces"), false);
+
+        assert!(config.ui);
+        assert_eq!(config.save_test_trace.as_deref(), Some("custom-traces"));
+    }
+
+    #[test]
+    fn trace_dir_is_not_enabled_without_ui() {
+        let config =
+            test_settings_to_config_with_ui_trace_default(&TestSettings::default(), None, false);
+
+        assert!(!config.ui);
+        assert_eq!(config.save_test_trace, None);
+    }
 }

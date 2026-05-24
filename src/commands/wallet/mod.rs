@@ -588,9 +588,8 @@ fn perform_localnet_airdrop(
         .build()
         .context("Failed to build HTTP client")?;
     let amount_nanotons = (amount_ton * 1_000_000_000.0) as u128;
-
     let response = client
-        .post(format!("http://localhost:{port}/admin/faucet"))
+        .post(format!("http://127.0.0.1:{port}/acton_fundAccount"))
         .json(&serde_json::json!({
             "address": address,
             "amount": amount_nanotons,

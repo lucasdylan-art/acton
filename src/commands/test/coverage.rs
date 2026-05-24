@@ -1,4 +1,5 @@
 use crate::context::{BuildCache, EmulationsState, compile_project_contract_with_cache};
+use crate::contract_interface::is_boc_path;
 use crate::file_build_cache::FileBuildCache;
 use acton_config::color::OwoColorize;
 use acton_config::config::ActonConfig;
@@ -121,7 +122,7 @@ pub(super) fn compile_project_contracts_for_coverage(
 
     for (contract_id, contract) in contracts {
         let path = contract.absolute_source_path(project_root);
-        if path.to_string_lossy().ends_with(".boc") {
+        if is_boc_path(&path) {
             continue;
         }
 
@@ -701,10 +702,10 @@ pub(super) fn print_coverage_summary(coverage: &Coverage) {
         .set_content_arrangement(ContentArrangement::Dynamic)
         .set_header(vec![
             "File",
-            "Covered Lines",
+            "Covered",
             "Total Lines",
             "% Lines",
-            "Covered Branches",
+            "Covered",
             "Total Branches",
             "% Branches",
             "Score",

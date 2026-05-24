@@ -1,18 +1,19 @@
 use super::handlers::utils::get_extra;
 use super::handlers::{
-    detect_address, detect_hash, emulate_trace_v1, faucet, get_account_states_v3,
+    detect_address, detect_hash, dump_state, emulate_trace_v1, faucet, get_account_states_v3,
     get_address_balance, get_address_information, get_address_information_v3, get_address_name,
     get_address_state, get_block_header, get_block_transactions, get_block_transactions_ext,
     get_compiler_abi, get_config_all, get_config_param, get_consensus_block,
     get_extended_address_information, get_jetton_masters, get_jetton_wallets, get_libraries,
     get_masterchain_info, get_nft_items, get_out_msg_queue_size, get_pending_transactions_v3,
-    get_shard_account_cell, get_shards, get_state_source, get_traces, get_transactions,
-    get_transactions_by_message_v3, get_transactions_std, get_transactions_v3, json_rpc,
-    lookup_block, pack_address, register_compiler_abis, run_get_method, run_get_method_std,
-    run_get_method_v3, send_boc, send_boc_return_hash, send_message_v3, set_address_name,
-    set_state_source, try_locate_result_tx, try_locate_source_tx, try_locate_tx, unpack_address,
+    get_shard_account_cell, get_shards, get_startup_wallets, get_status, get_traces,
+    get_transactions, get_transactions_by_message_v3, get_transactions_std, get_transactions_v3,
+    json_rpc, load_state, lookup_block, pack_address, register_compiler_abis, run_get_method,
+    run_get_method_std, run_get_method_v3, send_boc, send_boc_return_hash, send_internal_message,
+    send_message_v3, set_address_name, set_shard_account, try_locate_result_tx,
+    try_locate_source_tx, try_locate_tx, unpack_address,
 };
-use crate::localnet::Localnet;
+use crate::server::ServerState;
 use axum::{
     Json, Router,
     http::{HeaderValue, Method, StatusCode, request::Parts},
@@ -36,7 +37,7 @@ use tower_http::trace::TraceLayer;
 #[cfg(not(debug_assertions))]
 static UI_DIR: Dir<'static> = include_dir!("$CARGO_MANIFEST_DIR/../acton-localnet-ui/dist");
 
-pub fn create_router(node: Arc<Localnet>, rate_limit_rps: Option<u32>) -> Router {
+pub fn create_router(state: ServerState, rate_limit_rps: Option<u32>) -> Router {
     let api_v2_router = Router::new()
         .route("/v2", post(json_rpc))
         .route("/v2/jsonRPC", post(json_rpc))
@@ -100,18 +101,18 @@ pub fn create_router(node: Arc<Localnet>, rate_limit_rps: Option<u32>) -> Router
         .merge(api_v2_router)
         .merge(api_v3_router)
         .merge(emulate_router);
-    let admin_router = Router::new()
-        .route("/faucet", post(faucet))
-        .route(
-            "/address-name",
-            get(get_address_name).post(set_address_name),
-        )
-        .route("/compiler-abi", get(get_compiler_abi))
-        .route("/compiler-abis", post(register_compiler_abis))
-        .route(
-            "/state-source",
-            get(get_state_source).post(set_state_source),
-        );
+    let acton_router = Router::new()
+        .route("/acton_fundAccount", post(faucet))
+        .route("/acton_getAddressName", get(get_address_name))
+        .route("/acton_setAddressName", post(set_address_name))
+        .route("/acton_getCompilerAbi", get(get_compiler_abi))
+        .route("/acton_registerCompilerAbis", post(register_compiler_abis))
+        .route("/acton_dumpState", post(dump_state))
+        .route("/acton_loadState", post(load_state))
+        .route("/acton_setShardAccount", post(set_shard_account))
+        .route("/acton_sendInternalMessage", post(send_internal_message))
+        .route("/acton_getStartupWallets", get(get_startup_wallets))
+        .route("/acton_nodeInfo", get(get_status));
 
     if let Some(limit) = rate_limit_rps {
         let mut governor_config = GovernorConfigBuilder::default();
@@ -129,10 +130,10 @@ pub fn create_router(node: Arc<Localnet>, rate_limit_rps: Option<u32>) -> Router
 
     let app = Router::new()
         .nest("/api", api_router)
-        .nest("/admin", admin_router)
+        .merge(acton_router)
         .layer(loopback_cors())
         .layer(TraceLayer::new_for_http())
-        .with_state(node);
+        .with_state(state);
 
     #[cfg(debug_assertions)]
     let app = {

@@ -1,4 +1,11 @@
 import {defineConfig, defineDocs} from "fumadocs-mdx/config"
+import {
+  transformerMetaHighlight,
+  transformerNotationDiff,
+  transformerNotationFocus,
+  transformerNotationHighlight,
+  transformerNotationWordHighlight,
+} from "@shikijs/transformers"
 import {transformerTwoslash} from "fumadocs-twoslash"
 import {createFileSystemTypesCache} from "fumadocs-twoslash/cache-fs"
 import {readFileSync} from "node:fs"
@@ -18,14 +25,17 @@ import lastModified from "fumadocs-mdx/plugins/last-modified"
 import {tolkTwoslasher} from "@/lib/tolk-twoslash"
 import {pageSchema} from "fumadocs-core/source/schema"
 import {remarkMdxFiles} from "fumadocs-core/mdx-plugins"
+import {remarkMdxMermaid} from "fumadocs-core/mdx-plugins/remark-mdx-mermaid"
 import {parseCodeBlockAttributes} from "fumadocs-core/mdx-plugins/codeblock-utils"
 import {z} from "zod"
+import {remarkDocsVariables} from "@/lib/remark-docs-variables"
 
 export const docs = defineDocs({
   dir: "content/docs",
   docs: {
     schema: pageSchema.extend({
       description: z.string(),
+      sidebarTitle: z.string().optional(),
     }),
     postprocess: {
       includeProcessedMarkdown: true,
@@ -140,6 +150,7 @@ const customLangs = [
 
 const tolkFileIcon = readFileSync("public/logo-ton-gray.svg", "utf8")
 const actonTomlIcon = readFileSync("public/logo-acton-file.svg", "utf8")
+const terminalIcon = readFileSync("public/logo-terminal.svg", "utf8")
 
 const transformerNoCopy: ShikiTransformer = {
   name: "acton:no-copy",
@@ -164,6 +175,12 @@ export default defineConfig({
       lazy: false,
       icon: {
         extend: {
+          "acton-cli": terminalIcon,
+          "acton-cli-check": terminalIcon,
+          "acton-cli-wrapper": terminalIcon,
+          "acton-cli-mutate": terminalIcon,
+          "acton-cli-trace": terminalIcon,
+          "acton-gas-report": terminalIcon,
           "acton-toml": actonTomlIcon,
           tolk: tolkFileIcon,
         },
@@ -175,6 +192,11 @@ export default defineConfig({
       langs: [...builtinLangs, ...customLangs],
       transformers: [
         transformerNoCopy,
+        transformerMetaHighlight(),
+        transformerNotationHighlight({matchAlgorithm: "v3"}),
+        transformerNotationWordHighlight({matchAlgorithm: "v3"}),
+        transformerNotationDiff({matchAlgorithm: "v3"}),
+        transformerNotationFocus({matchAlgorithm: "v3"}),
         transformerTwoslash({
           typesCache: createFileSystemTypesCache(),
           langs: ["tolk"],
@@ -182,6 +204,6 @@ export default defineConfig({
         }),
       ],
     },
-    remarkPlugins: [remarkMdxFiles],
+    remarkPlugins: [remarkDocsVariables, remarkMdxFiles, remarkMdxMermaid],
   },
 })

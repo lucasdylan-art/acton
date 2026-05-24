@@ -1,5 +1,6 @@
 use crate::commands::common::error_fmt;
 use crate::commands::test::reporting::{FuzzExecutionContext, TestReport, TestReporter};
+use crate::commands::test::trace;
 use crate::formatter::FormatterContext;
 use acton_config::color::OwoColorize;
 use anyhow::Context;
@@ -7,11 +8,12 @@ use axum::{
     Router,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
-    response::{IntoResponse, Json},
+    response::{IntoResponse, Json, Response},
     routing::get,
 };
 #[cfg(not(debug_assertions))]
 use include_dir::{Dir, include_dir};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -60,7 +62,7 @@ struct UiTestReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     detailed_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    failed_transactions: Option<Vec<crate::commands::test::trace::TransactionInfo>>,
+    failed_transactions: Option<Vec<trace::TransactionInfo>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failed_transaction_context: Option<crate::commands::test::reporting::FailedTransactionContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -71,6 +73,11 @@ struct UiTestReport {
     execution: Option<UiExecutionSummary>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     trace_path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct UiApiError {
+    error: String,
 }
 
 impl From<&TestReport> for UiTestReport {
@@ -197,6 +204,10 @@ fn build_ui_api_router(state: Arc<UiServerState>) -> Router {
 }
 
 fn open_browser(url: &str) {
+    if std::env::var_os("ACTON_INTERNAL_SKIP_BROWSER").is_some() {
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     {
         let chromium_browsers = [
@@ -393,19 +404,59 @@ async fn handle_api_trace(
     State(state): State<Arc<UiServerState>>,
 ) -> impl IntoResponse {
     let Some(trace_dir) = &state.trace_dir else {
-        return (StatusCode::NOT_FOUND, "Traces not enabled").into_response();
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "Trace export is not enabled for this Test UI run",
+        );
     };
 
+    let requested = Path::new(&name);
+    let trace_candidate = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        trace_dir.join(requested)
+    };
+
+    if !trace_candidate.exists() {
+        return StatusCode::NO_CONTENT.into_response();
+    }
+
     let Some(trace_path) = resolve_path_within_root(trace_dir, Path::new(&name)) else {
-        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+        warn!(
+            "Test UI rejected trace '{}' because it resolves outside {}",
+            name,
+            trace_dir.display()
+        );
+        return api_error(
+            StatusCode::FORBIDDEN,
+            format!("Trace path '{name}' is outside the configured trace directory"),
+        );
     };
 
     match tokio::fs::read_to_string(trace_path).await {
-        Ok(content) => match serde_json::from_str::<serde_json::Value>(&content) {
-            Ok(json) => Json(json).into_response(),
-            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, "Invalid trace JSON").into_response(),
-        },
-        Err(_) => (StatusCode::NOT_FOUND, "Trace not found").into_response(),
+        Ok(content) => {
+            if content.trim().is_empty() {
+                return StatusCode::NO_CONTENT.into_response();
+            }
+
+            match serde_json::from_str::<serde_json::Value>(&content) {
+                Ok(json) => Json(json).into_response(),
+                Err(err) => {
+                    warn!("Test UI failed to parse trace '{name}': {err}");
+                    api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Trace file '{name}' is not valid JSON: {err}"),
+                    )
+                }
+            }
+        }
+        Err(err) => {
+            warn!("Test UI failed to read trace '{name}': {err}");
+            api_error(
+                StatusCode::NOT_FOUND,
+                format!("Trace file '{name}' could not be read: {err}"),
+            )
+        }
     }
 }
 
@@ -418,7 +469,7 @@ async fn handle_api_contract(
     };
 
     let contracts_dir = trace_dir.join("contracts");
-    let contract_name = format!("{name}.json");
+    let contract_name = trace::contract_file_name(&name);
     let Some(contract_path) = resolve_path_within_root(&contracts_dir, Path::new(&contract_name))
     else {
         return (StatusCode::FORBIDDEN, "Access denied").into_response();
@@ -441,6 +492,16 @@ fn resolve_path_within_root(root: &Path, requested: &Path) -> Option<PathBuf> {
     };
     let candidate = dunce::canonicalize(candidate).ok()?;
     candidate.starts_with(root).then_some(candidate)
+}
+
+fn api_error(status: StatusCode, error: impl Into<String>) -> Response {
+    (
+        status,
+        Json(UiApiError {
+            error: error.into(),
+        }),
+    )
+        .into_response()
 }
 
 fn non_empty_text(value: &str) -> Option<String> {

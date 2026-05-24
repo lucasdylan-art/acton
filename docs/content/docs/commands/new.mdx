@@ -205,6 +205,12 @@ Control when to use colored output.
 
 </CommandOptionMeta>
 
+<CommandOptionMeta label="Default">
+
+`auto`
+
+</CommandOptionMeta>
+
 </CommandOption>
 
 
@@ -232,6 +238,12 @@ Accepted as a global Acton option for CLI consistency.
 The command does not resolve a project manifest before running, and this option
 remains mutually exclusive with `--project-root`.
 
+<CommandOptionMeta label="Conflicts with">
+
+`--project-root`
+
+</CommandOptionMeta>
+
 </CommandOption>
 
 
@@ -251,6 +263,12 @@ Accepted as a global Acton option for CLI consistency.
 `acton new` creates a project and does not require an existing project root.
 The command does not resolve a project root before running, and this option
 remains mutually exclusive with `--manifest-path`.
+
+<CommandOptionMeta label="Conflicts with">
+
+`--manifest-path`
+
+</CommandOptionMeta>
 
 </CommandOption>
 
@@ -431,7 +449,8 @@ The command does not create a commit and does not modify parent directories.
 2. Create a non-interactive counter project with explicit metadata:
 
    ```bash
-   acton new my-project --name "My Project" --description "Cool description" --template counter --license MIT
+   acton new my-project --name "My Project" --description "Cool description" \
+                                            --template counter --license MIT
    ```
 
 3. Create a project with the TypeScript app layout:
@@ -449,7 +468,8 @@ The command does not create a commit and does not modify parent directories.
 5. Create a project in the current directory:
 
    ```bash
-   acton new . --template empty --name "My Project" --description "A TON blockchain project" --license MIT
+   acton new . --template empty --name "My Project" --description "A TON blockchain project" \
+                                                    --license MIT
    ```
 
 ## See Also

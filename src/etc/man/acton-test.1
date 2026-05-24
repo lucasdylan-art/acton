@@ -213,18 +213,10 @@ shared contract metadata under \fBcontracts/<contract\-name>.json\fR\&.
 These filenames are derived only from the test name and contract name, so
 duplicate names overwrite earlier artifacts in the same output directory.
 Relative paths are resolved from the project root.
+.sp
+The Test UI also enables the default \fBbuild/traces\fR directory when trace export
+is not configured explicitly, including when UI is enabled through \fB[test].ui\fR\&.
 .RE
-.SH "TONCENTER API KEYS"
-When tests fork from the built\-in \fBmainnet\fR/\fBtestnet\fR backends, authenticated
-requests read \fBTONCENTER_MAINNET_API_KEY\fR or \fBTONCENTER_TESTNET_API_KEY\fR\&.
-.sp
-When tests fork from \fBcustom:<name>\fR, Acton reads \fB<NORMALIZED_NAME>_API_KEY\fR\&.
-Custom network names are uppercased and non\-alphanumeric characters are
-replaced with \fB_\fR, so \fBcustom:mock\-remote\fR becomes \fBMOCK_REMOTE_API_KEY\fR\&.
-.sp
-Acton loads \fB\&.env\fR automatically, so the simplest setup during project work is
-usually to keep these keys there and use shell environment variables only for
-one\-off overrides or CI.
 .SS "Mutation Testing Options"
 .sp
 \fB\-\-mutate\fR
@@ -350,6 +342,17 @@ defaults.
 .sp
 This conflicts with \fB\-\-manifest\-path\fR\&.
 .RE
+.SH "TONCENTER API KEYS"
+When tests fork from the built\-in \fBmainnet\fR/\fBtestnet\fR backends, authenticated
+requests read \fBTONCENTER_MAINNET_API_KEY\fR or \fBTONCENTER_TESTNET_API_KEY\fR\&.
+.sp
+When tests fork from \fBcustom:<name>\fR, Acton reads \fB<NORMALIZED_NAME>_API_KEY\fR\&.
+Custom network names are uppercased and non\-alphanumeric characters are
+replaced with \fB_\fR, so \fBcustom:mock\-remote\fR becomes \fBMOCK_REMOTE_API_KEY\fR\&.
+.sp
+Acton loads \fB\&.env\fR automatically, so the simplest setup during project work is
+usually to keep these keys there and use shell environment variables only for
+one\-off overrides or CI.
 .SH "DISCOVERY"
 Acton discovers tests by finding files that end with \fB\&.test.tolk\fR\&.
 .sp
@@ -559,6 +562,11 @@ inspecting transaction trees
 .RE
 .sp
 .RS 4
+\h'-04'\(bu\h'+03'Test UI writes trace bundles to \fBbuild/traces\fR by default unless
+\fB\-\-save\-test\-trace\fR or \fB[test].save\-test\-trace\fR chooses another directory
+.RE
+.sp
+.RS 4
 \h'-04'\(bu\h'+03'You can combine \fB\-\-coverage\fR and \fB\-\-ui\fR to inspect the current run\[cq]s coverage
 directly in the browser UI
 .RE
@@ -668,7 +676,8 @@ acton test \-\-verbose \-\-filter "debug.*"
 .sp
 .RS 4
 .nf
-acton test \-\-coverage \-\-coverage\-format lcov \-\-reporter junit \-\-junit\-path test\-results
+acton test \-\-coverage \-\-coverage\-format lcov \-\-reporter junit \(rs
+                                             \-\-junit\-path test\-results
 .fi
 .RE
 .RE
@@ -718,7 +727,8 @@ acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-diff worktree
 .sp
 .RS 4
 .nf
-acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-diff branch \-\-mutation\-levels critical,major
+acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-diff branch \(rs
+                                             \-\-mutation\-levels critical,major
 .fi
 .RE
 .RE
@@ -739,7 +749,8 @@ acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-id 2
 .sp
 .RS 4
 .nf
-acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-session\-id wallet\-pr\-42 \-\-mutation\-diff worktree
+acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-session\-id wallet\-pr\-42 \(rs
+                                             \-\-mutation\-diff worktree
 .fi
 .RE
 .sp
@@ -769,7 +780,9 @@ acton test \-\-mutate \-\-mutate\-contract Wallet \-\-mutation\-workers 4
 .sp
 .RS 4
 .nf
-acton test tests/wallet.test.tolk \-\-fork\-net testnet \-\-fork\-block\-number 55000000 \-\-save\-test\-trace \-\-ui
+acton test tests/wallet.test.tolk \-\-fork\-net testnet \(rs
+                                  \-\-fork\-block\-number 55000000 \(rs
+                                  \-\-save\-test\-trace \-\-ui
 .fi
 .RE
 .sp
@@ -779,7 +792,8 @@ acton test tests/wallet.test.tolk \-\-fork\-net testnet \-\-fork\-block\-number 
 .sp
 .RS 4
 .nf
-acton test \-\-baseline\-snapshot build/gas\-baseline.json \-\-fail\-on\-diff \-\-reporter console,junit
+acton test \-\-baseline\-snapshot build/gas\-baseline.json \-\-fail\-on\-diff \(rs
+                                                       \-\-reporter console,junit
 .fi
 .RE
 .SH "SEE ALSO"

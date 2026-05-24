@@ -230,22 +230,12 @@ shared contract metadata under `contracts/<contract-name>.json`.
 These filenames are derived only from the test name and contract name, so
 duplicate names overwrite earlier artifacts in the same output directory.
 Relative paths are resolved from the project root.
+
+The Test UI also enables the default `build/traces` directory when trace export
+is not configured explicitly, including when UI is enabled through `[test].ui`.
 {{/option}}
 
 {{/options}}
-
-## TonCenter API Keys
-
-When tests fork from the built-in `mainnet`/`testnet` backends, authenticated
-requests read `TONCENTER_MAINNET_API_KEY` or `TONCENTER_TESTNET_API_KEY`.
-
-When tests fork from `custom:<name>`, Acton reads `<NORMALIZED_NAME>_API_KEY`.
-Custom network names are uppercased and non-alphanumeric characters are
-replaced with `_`, so `custom:mock-remote` becomes `MOCK_REMOTE_API_KEY`.
-
-Acton loads `.env` automatically, so the simplest setup during project work is
-usually to keep these keys there and use shell environment variables only for
-one-off overrides or CI.
 
 ### Mutation Testing Options
 
@@ -340,6 +330,19 @@ May be passed multiple times.
 ### Project Options
 
 {{> options-project-resolved }}
+
+## TonCenter API Keys
+
+When tests fork from the built-in `mainnet`/`testnet` backends, authenticated
+requests read `TONCENTER_MAINNET_API_KEY` or `TONCENTER_TESTNET_API_KEY`.
+
+When tests fork from `custom:<name>`, Acton reads `<NORMALIZED_NAME>_API_KEY`.
+Custom network names are uppercased and non-alphanumeric characters are
+replaced with `_`, so `custom:mock-remote` becomes `MOCK_REMOTE_API_KEY`.
+
+Acton loads `.env` automatically, so the simplest setup during project work is
+usually to keep these keys there and use shell environment variables only for
+one-off overrides or CI.
 
 ## Discovery
 
@@ -460,6 +463,8 @@ CLI flags override config values for the current invocation.
 - `--fail-on-diff` requires `--baseline-snapshot`
 - The UI and trace export features are useful for debugging failing tests and
   inspecting transaction trees
+- Test UI writes trace bundles to `build/traces` by default unless
+  `--save-test-trace` or `[test].save-test-trace` chooses another directory
 - You can combine `--coverage` and `--ui` to inspect the current run's coverage
   directly in the browser UI
 - `--coverage-minimum-percent` and `[test.coverage].minimum-percent` are ignored
@@ -515,7 +520,8 @@ CLI flags override config values for the current invocation.
 4. Generate coverage and JUnit output:
 
    ```bash
-   acton test --coverage --coverage-format lcov --reporter junit --junit-path test-results
+   acton test --coverage --coverage-format lcov --reporter junit \
+                                                --junit-path test-results
    ```
 
 5. Fail the run when line coverage drops below 85%:
@@ -545,7 +551,8 @@ CLI flags override config values for the current invocation.
 9. Run mutation testing for selected levels on the current branch:
 
    ```bash
-   acton test --mutate --mutate-contract Wallet --mutation-diff branch --mutation-levels critical,major
+   acton test --mutate --mutate-contract Wallet --mutation-diff branch \
+                                                --mutation-levels critical,major
    ```
 
 10. Re-run one specific mutant from a previous report:
@@ -557,7 +564,8 @@ CLI flags override config values for the current invocation.
 11. Resume an unfinished mutation session:
 
    ```bash
-   acton test --mutate --mutate-contract Wallet --mutation-session-id wallet-pr-42 --mutation-diff worktree
+   acton test --mutate --mutate-contract Wallet --mutation-session-id wallet-pr-42 \
+                                                --mutation-diff worktree
    ```
 
 12. Fail the run when mutation score drops below 85%:
@@ -575,13 +583,16 @@ CLI flags override config values for the current invocation.
 14. Debug a forked-state failure with traces and the UI:
 
    ```bash
-   acton test tests/wallet.test.tolk --fork-net testnet --fork-block-number 55000000 --save-test-trace --ui
+   acton test tests/wallet.test.tolk --fork-net testnet \
+                                     --fork-block-number 55000000 \
+                                     --save-test-trace --ui
    ```
 
 15. Enforce a gas baseline in CI:
 
    ```bash
-   acton test --baseline-snapshot build/gas-baseline.json --fail-on-diff --reporter console,junit
+   acton test --baseline-snapshot build/gas-baseline.json --fail-on-diff \
+                                                          --reporter console,junit
    ```
 
 ## See Also

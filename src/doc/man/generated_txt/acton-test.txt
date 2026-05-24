@@ -159,19 +159,9 @@ OPTIONS
            duplicate names overwrite earlier artifacts in the same output
            directory. Relative paths are resolved from the project root.
 
-TONCENTER API KEYS
-       When tests fork from the built-in mainnet/testnet backends,
-       authenticated requests read TONCENTER_MAINNET_API_KEY or
-       TONCENTER_TESTNET_API_KEY.
-
-       When tests fork from custom:<name>, Acton reads
-       <NORMALIZED_NAME>_API_KEY. Custom network names are uppercased and
-       non-alphanumeric characters are replaced with _, so custom:mock-remote
-       becomes MOCK_REMOTE_API_KEY.
-
-       Acton loads .env automatically, so the simplest setup during project
-       work is usually to keep these keys there and use shell environment
-       variables only for one-off overrides or CI.
+           The Test UI also enables the default build/traces directory when
+           trace export is not configured explicitly, including when UI is
+           enabled through [test].ui.
 
    Mutation Testing Options
        --mutate
@@ -266,6 +256,20 @@ TONCENTER API KEYS
            relative defaults.
 
            This conflicts with --manifest-path.
+
+TONCENTER API KEYS
+       When tests fork from the built-in mainnet/testnet backends,
+       authenticated requests read TONCENTER_MAINNET_API_KEY or
+       TONCENTER_TESTNET_API_KEY.
+
+       When tests fork from custom:<name>, Acton reads
+       <NORMALIZED_NAME>_API_KEY. Custom network names are uppercased and
+       non-alphanumeric characters are replaced with _, so custom:mock-remote
+       becomes MOCK_REMOTE_API_KEY.
+
+       Acton loads .env automatically, so the simplest setup during project
+       work is usually to keep these keys there and use shell environment
+       variables only for one-off overrides or CI.
 
 DISCOVERY
        Acton discovers tests by finding files that end with .test.tolk.
@@ -407,6 +411,9 @@ NOTES
        o  The UI and trace export features are useful for debugging failing
           tests and inspecting transaction trees
 
+       o  Test UI writes trace bundles to build/traces by default unless
+          --save-test-trace or [test].save-test-trace chooses another directory
+
        o  You can combine --coverage and --ui to inspect the current run’s
           coverage directly in the browser UI
 
@@ -469,7 +476,8 @@ EXAMPLES
 
        4. Generate coverage and JUnit output:
 
-              acton test --coverage --coverage-format lcov --reporter junit --junit-path test-results
+              acton test --coverage --coverage-format lcov --reporter junit \
+                                                           --junit-path test-results
 
        5. Fail the run when line coverage drops below 85%:
 
@@ -489,7 +497,8 @@ EXAMPLES
 
        9. Run mutation testing for selected levels on the current branch:
 
-              acton test --mutate --mutate-contract Wallet --mutation-diff branch --mutation-levels critical,major
+              acton test --mutate --mutate-contract Wallet --mutation-diff branch \
+                                                           --mutation-levels critical,major
 
        10. Re-run one specific mutant from a previous report:
 
@@ -497,7 +506,8 @@ EXAMPLES
 
        11. Resume an unfinished mutation session:
 
-           acton test --mutate --mutate-contract Wallet --mutation-session-id wallet-pr-42 --mutation-diff worktree
+           acton test --mutate --mutate-contract Wallet --mutation-session-id wallet-pr-42 \
+                                                        --mutation-diff worktree
 
        12. Fail the run when mutation score drops below 85%:
 
@@ -509,11 +519,14 @@ EXAMPLES
 
        14. Debug a forked-state failure with traces and the UI:
 
-           acton test tests/wallet.test.tolk --fork-net testnet --fork-block-number 55000000 --save-test-trace --ui
+           acton test tests/wallet.test.tolk --fork-net testnet \
+                                             --fork-block-number 55000000 \
+                                             --save-test-trace --ui
 
        15. Enforce a gas baseline in CI:
 
-           acton test --baseline-snapshot build/gas-baseline.json --fail-on-diff --reporter console,junit
+           acton test --baseline-snapshot build/gas-baseline.json --fail-on-diff \
+                                                                  --reporter console,junit
 
 SEE ALSO
        o  acton help wrapper

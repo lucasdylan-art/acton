@@ -3,8 +3,8 @@ use crate::commands::test::trace::TransactionInfo;
 use crate::context;
 use crate::context::{
     AssertFailure, BuildCache, DisplayParam, EmulationsState, ExternalMessageNotFoundFailure,
-    GetMethodAssertFailure, KnownAddresses, TransactionGenericAssertFailure, WalletNotFoundFailure,
-    to_cell,
+    ExternalSendNotAcceptedFailure, GetMethodAssertFailure, KnownAddresses,
+    TransactionGenericAssertFailure, WalletNotFoundFailure, to_cell,
 };
 use crate::ffi::assert::{rendered_values_equal, union_case_payload};
 use crate::retrace::{
@@ -69,6 +69,7 @@ struct DecodedMessageBody {
 enum MessageBodyDirection {
     Incoming,
     Outgoing,
+    ExternalOutgoing,
 }
 
 enum FormattedExtraInfo {
@@ -207,6 +208,16 @@ impl<'a> FormatterContext<'a> {
         Self::find_custom_exit_code_info(code, build.abi.as_deref())
     }
 
+    fn find_address_custom_exit_code_info(
+        &self,
+        addr: &StdAddr,
+        code: i32,
+    ) -> Option<AbiExitCodeInfo> {
+        let code_cell = Self::account_code(&self.accounts, addr);
+        let (_, build) = self.build_cache.result_for_code(&code_cell)?;
+        Self::find_custom_exit_code_info(code, build.abi.as_deref())
+    }
+
     fn find_code_custom_exit_code_info(
         &self,
         code_boc64: &str,
@@ -215,6 +226,63 @@ impl<'a> FormatterContext<'a> {
         let code_cell = Boc::decode_base64(code_boc64).ok();
         let (_, build) = self.build_cache.result_for_code(&code_cell)?;
         Self::find_custom_exit_code_info(exit_code, build.abi.as_deref())
+    }
+
+    pub(crate) fn format_external_not_accepted_vm_result(
+        &self,
+        failure: &ExternalSendNotAcceptedFailure,
+    ) -> Option<(&'static str, String)> {
+        if let Some(reason) = self.external_not_accepted_compute_skip_reason(failure.diagnostic_id)
+        {
+            return Some(("Compute phase skipped:", reason.to_owned()));
+        }
+
+        let exit_code = failure.vm_exit_code?;
+        if matches!(exit_code, 0 | 1) {
+            return Some(("VM exit code:", exit_code.to_string()));
+        }
+        if let Some(info) =
+            exit_codes::find_for_phase(exit_code, exit_codes::ExitCodePhase::Compute)
+        {
+            return Some(("Compute phase failed:", info.description.to_owned()));
+        }
+
+        if let Some(info) = failure
+            .destination
+            .as_ref()
+            .and_then(|addr| self.find_address_custom_exit_code_info(addr, exit_code))
+        {
+            return Some(("Compute phase failed:", info.description));
+        }
+
+        Some(("Compute phase failed:", format!("exit code {exit_code}")))
+    }
+
+    fn external_not_accepted_compute_skip_reason(
+        &self,
+        diagnostic_id: Option<u64>,
+    ) -> Option<&'static str> {
+        let logs = diagnostic_id
+            .and_then(|id| self.emulations.find_failed_message(id))
+            .and_then(|message| message.executor_logs.as_deref())?;
+
+        if logs.contains("address is suspended, skipping compute phase") {
+            return Some("Suspended");
+        }
+        if logs.contains("no state, cannot perform transactions") {
+            return Some("No state");
+        }
+        if logs.contains("in_msg_state hash mismatch")
+            || logs.contains("cannot unpack in_msg_state")
+            || logs.contains("bad fixed_prefix_length")
+        {
+            return Some("Bad state");
+        }
+        if logs.contains("no gas") {
+            return Some("No gas");
+        }
+
+        None
     }
 
     #[must_use]
@@ -354,16 +422,18 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
 
         if message.is_empty() {
             lines.push(format!(
-                "└── submitted to network; call {} to confirm inclusion",
-                "res.waitForFirstTransaction()".yellow()
+                "└── submitted to network; call {} to confirm inclusion or {} for the full trace",
+                "res.waitForFirstTransaction()".yellow(),
+                "res.waitForTrace()".yellow()
             ));
             return lines.join("\n");
         }
 
         lines.push(format!("└── {message}"));
         lines.push(format!(
-            "    └── submitted to network; call {} to confirm inclusion",
-            "res.waitForFirstTransaction()".yellow()
+            "    └── submitted to network; call {} to confirm inclusion or {} for the full trace",
+            "res.waitForFirstTransaction()".yellow(),
+            "res.waitForTrace()".yellow()
         ));
         lines.join("\n")
     }
@@ -899,14 +969,14 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
 
                 self.try_decode_message_with_builds(
                     in_msg.body,
-                    self.prioritized_builds(destination_build),
+                    self.build_cache.prioritized_results(destination_build),
                     destination_direction,
                     info.bounced,
                 )
                 .or_else(|| {
                     self.try_decode_message_with_builds(
                         in_msg.body,
-                        self.prioritized_builds(source_build),
+                        self.build_cache.prioritized_results(source_build),
                         source_direction,
                         info.bounced,
                     )
@@ -989,13 +1059,12 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
         tx: &Transaction,
         msg: &RelaxedMessage,
     ) -> Option<DecodedMessageBody> {
-        let build = self.build_result_for_tx_account(tx)?;
-        let abi = build.abi.as_ref()?;
-        self.try_decode_message_body_types(
+        let build = self.build_result_for_tx_account(tx);
+        self.try_decode_message_with_builds(
             msg.body,
-            abi,
-            abi.emitted_events.iter().map(|message| message.body_ty_idx),
-            0,
+            self.build_cache.prioritized_results(build),
+            MessageBodyDirection::ExternalOutgoing,
+            false,
         )
     }
 
@@ -1023,36 +1092,6 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
         self.build_cache
             .result_for_code(&code)
             .map(|(_, result)| result)
-    }
-
-    fn prioritized_builds(
-        &self,
-        preferred: Option<context::CompilationResult>,
-    ) -> Vec<context::CompilationResult> {
-        let mut builds = Vec::new();
-        let mut seen = HashSet::new();
-        if let Some(preferred) = preferred {
-            seen.insert(Self::build_result_key(&preferred));
-            builds.push(preferred);
-        }
-
-        let mut fallback_builds = self.build_cache.built.iter().collect::<Vec<_>>();
-        fallback_builds.sort_by(|(left_path, left), (right_path, right)| {
-            left.name
-                .cmp(&right.name)
-                .then_with(|| left_path.cmp(right_path))
-        });
-        for (_, build) in fallback_builds {
-            if seen.insert(Self::build_result_key(build)) {
-                builds.push(build.clone());
-            }
-        }
-
-        builds
-    }
-
-    fn build_result_key(build: &context::CompilationResult) -> String {
-        format!("{}:{}", build.name, build.code_hash)
     }
 
     fn try_decode_message_with_builds(
@@ -1100,6 +1139,22 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
                 }
             }
             MessageBodyDirection::Outgoing => {
+                for message in &abi.outgoing_messages {
+                    Self::push_compiler_message_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        message.body_ty_idx,
+                    );
+                }
+            }
+            MessageBodyDirection::ExternalOutgoing => {
+                for message in &abi.emitted_events {
+                    Self::push_compiler_message_candidate(
+                        &mut candidates,
+                        &mut seen,
+                        message.body_ty_idx,
+                    );
+                }
                 for message in &abi.outgoing_messages {
                     Self::push_compiler_message_candidate(
                         &mut candidates,
@@ -1672,33 +1727,11 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
             )));
         }
 
-        if let Some(missing_libraries) = self.emulations.find_tx_missing_libraries(tx.lt)
-            && !missing_libraries.is_empty()
-        {
-            let mut missing_libraries = missing_libraries.iter().cloned().collect::<Vec<_>>();
-            missing_libraries.sort_unstable();
-
-            if missing_libraries.len() == 1 {
-                extra_infos.push(FormattedExtraInfo::Tree(format!(
-                    "Library {} is missing, which is what causes this error",
-                    missing_libraries.join(", ").yellow()
-                )));
-            } else {
-                extra_infos.push(FormattedExtraInfo::Tree(format!(
-                    "Missing libraries: {}",
-                    missing_libraries.join(", ").yellow()
-                )));
+        if let Some(missing_libraries) = self.emulations.find_tx_missing_libraries(tx.lt) {
+            for line in Self::format_missing_libraries_help_lines(missing_libraries.iter().cloned())
+            {
+                extra_infos.push(FormattedExtraInfo::Tree(line));
             }
-            extra_infos.push(FormattedExtraInfo::Tree(
-                "This most likely happened because the library is not registered in tests"
-                    .to_owned(),
-            ));
-            extra_infos.push(FormattedExtraInfo::Tree(format!(
-                "To manually register library use {} somewhere in {}-like function",
-                "testing.registerLibrary(code)".yellow(),
-                "setupTests()".yellow(),
-            )));
-            extra_infos.push(FormattedExtraInfo::Tree("Learn more about libraries in documentation: https://ton-blockchain.github.io/acton/docs/libraries".to_owned()));
         }
 
         self.format_transaction_backtrace(tx, child_prefix, extra_infos);
@@ -2146,8 +2179,7 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
             .as_ref()
             .and_then(|src| self.build_result_for_address(Some(src)));
 
-        self.message_name_from_preferred_builds(opcode, destination_build)
-            .or_else(|| self.message_name_from_preferred_builds(opcode, source_build))
+        self.message_name_from_endpoint_builds(opcode, destination_build, source_build)
             .or_else(|| (opcode == 0).then(|| "empty".to_owned()))
     }
 
@@ -2158,7 +2190,7 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
 
     fn format_outgoing_external_message_name(&self, tx: &Transaction, opcode: u32) -> String {
         let build = self.build_result_for_tx_account(tx);
-        self.format_message_name_from_build(opcode, build.as_ref())
+        self.format_message_name_from_builds(opcode, self.build_cache.prioritized_results(build))
     }
 
     fn format_message_name_from_build(
@@ -2167,8 +2199,20 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
         build: Option<&context::CompilationResult>,
     ) -> String {
         if let Some(build) = build
-            && let Some(name) = Self::message_name_from_build(build, opcode)
+            && let Some(name) = build.message_name_by_opcode(opcode)
         {
+            return Self::color_message_name(&name);
+        }
+
+        self.format_unknown_message_name(opcode)
+    }
+
+    fn format_message_name_from_builds(
+        &self,
+        opcode: u32,
+        builds: impl IntoIterator<Item = context::CompilationResult>,
+    ) -> String {
+        if let Some(name) = self.build_cache.message_name_by_opcode(opcode, builds) {
             return Self::color_message_name(&name);
         }
 
@@ -2183,23 +2227,36 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
         }
     }
 
-    fn message_name_from_preferred_builds(
+    fn message_name_from_endpoint_builds(
         &self,
         opcode: u32,
-        preferred: Option<context::CompilationResult>,
+        destination_build: Option<context::CompilationResult>,
+        source_build: Option<context::CompilationResult>,
     ) -> Option<String> {
-        self.prioritized_builds(preferred)
-            .into_iter()
-            .find_map(|build| Self::message_name_from_build(&build, opcode))
+        self.build_cache.message_name_by_opcode(
+            opcode,
+            [destination_build, source_build].into_iter().flatten(),
+        )
     }
 
-    fn message_name_from_build(build: &context::CompilationResult, opcode: u32) -> Option<String> {
-        ContractABI::find_message_name_by_opcode_with_symbols(
-            build.source_map.as_ref(),
-            build.abi.as_deref(),
-            opcode,
-        )
-        .map(str::to_owned)
+    fn message_name_from_search_params(
+        &self,
+        opcode: u32,
+        params: &context::TransactionNotFoundParams,
+    ) -> Option<String> {
+        let destination_build = self.build_result_for_display_address(params.to.as_ref());
+        let source_build = self.build_result_for_display_address(params.from.as_ref());
+        self.message_name_from_endpoint_builds(opcode, destination_build, source_build)
+    }
+
+    fn build_result_for_display_address(
+        &self,
+        address: Option<&DisplayParam<IntAddr>>,
+    ) -> Option<context::CompilationResult> {
+        let Some(DisplayParam::Value(address)) = address else {
+            return None;
+        };
+        self.build_result_for_address(Some(address))
     }
 
     fn get_contract_type(&self, addr: &IntAddr) -> Option<String> {
@@ -2233,7 +2290,7 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
         // so we can find compiled contract and its name
         let compilation_result = self.build_cache.result_for_code(&Some(code));
         if let Some((_, result)) = compilation_result {
-            return Some(result.name);
+            return Some(result.display_name);
         }
 
         None
@@ -2288,6 +2345,20 @@ See https://ton-blockchain.github.io/acton/docs/wallets for more information
 
     fn is_string_like_ty_idx(source_map: &SourceMap, ty_idx: TyIdx) -> bool {
         matches!(source_map.ty_by_idx(ty_idx), Some(Ty::String))
+    }
+
+    fn is_number_like_ty_idx(source_map: &SourceMap, ty_idx: TyIdx) -> bool {
+        matches!(
+            source_map.ty_by_idx(ty_idx),
+            Some(
+                Ty::Int
+                    | Ty::IntN { .. }
+                    | Ty::UintN { .. }
+                    | Ty::VarintN { .. }
+                    | Ty::VaruintN { .. }
+                    | Ty::Coins
+            )
+        )
     }
 
     fn strip_top_level_string_quotes(formatted: String) -> String {
@@ -2378,7 +2449,10 @@ impl FormatterContext<'_> {
         let left_is_string = Self::is_string_like_ty_idx(source_map, left_ty_idx);
         let right_is_string = Self::is_string_like_ty_idx(source_map, right_ty_idx);
 
-        if left_ty_idx != right_ty_idx {
+        if left_ty_idx != right_ty_idx
+            && !(Self::is_number_like_ty_idx(source_map, left_ty_idx)
+                && Self::is_number_like_ty_idx(source_map, right_ty_idx))
+        {
             return format!(
                 "{} != {}",
                 self.format_rendered_assert_value(&left_rendered, left_is_string),
@@ -2411,6 +2485,18 @@ impl FormatterContext<'_> {
                     fields: left_fields,
                 },
                 RenderedValue::Struct {
+                    type_name: right_type,
+                    fields: right_fields,
+                },
+            ) if left_type == right_type => {
+                self.format_struct_diff(left_type, left_fields, right_fields)
+            }
+            (
+                RenderedValue::MapKV {
+                    type_name: left_type,
+                    fields: left_fields,
+                },
+                RenderedValue::MapKV {
                     type_name: right_type,
                     fields: right_fields,
                 },
@@ -2707,6 +2793,7 @@ impl FormatterContext<'_> {
         matches!(
             value,
             RenderedValue::Struct { .. }
+                | RenderedValue::MapKV { .. }
                 | RenderedValue::Tensor { .. }
                 | RenderedValue::ArrayOf { .. }
                 | RenderedValue::UnionCase { .. }
@@ -2715,32 +2802,48 @@ impl FormatterContext<'_> {
 
     #[must_use]
     pub fn format_send_msg_flags(flags: SendMsgFlags) -> String {
-        let mut flag_names = Vec::new();
+        Self::format_send_mode_parts(u32::from(flags.bits()), "", false)
+    }
 
-        if flags.contains(SendMsgFlags::PAY_FEE_SEPARATELY) {
-            flag_names.push("PAY_FEES_SEPARATELY");
+    fn format_send_mode_parts(mode: u32, prefix: &str, include_estimate_fee_only: bool) -> String {
+        let mut flag_names = Vec::new();
+        let mut push_flag = |flag: SendMsgFlags, name: &str| {
+            if mode & u32::from(flag.bits()) != 0 {
+                flag_names.push(format!("{prefix}{name}"));
+            }
+        };
+
+        push_flag(SendMsgFlags::PAY_FEE_SEPARATELY, "PAY_FEES_SEPARATELY");
+        push_flag(SendMsgFlags::IGNORE_ERROR, "IGNORE_ERRORS");
+        push_flag(SendMsgFlags::BOUNCE_ON_ERROR, "BOUNCE_ON_ACTION_FAIL");
+        push_flag(SendMsgFlags::DELETE_IF_EMPTY, "DESTROY");
+        push_flag(
+            SendMsgFlags::WITH_REMAINING_BALANCE,
+            "CARRY_ALL_REMAINING_MESSAGE_VALUE",
+        );
+        push_flag(SendMsgFlags::ALL_BALANCE, "CARRY_ALL_BALANCE");
+
+        if include_estimate_fee_only && mode & 1024 != 0 {
+            flag_names.push(format!("{prefix}ESTIMATE_FEE_ONLY"));
         }
-        if flags.contains(SendMsgFlags::IGNORE_ERROR) {
-            flag_names.push("IGNORE_ERRORS");
-        }
-        if flags.contains(SendMsgFlags::BOUNCE_ON_ERROR) {
-            flag_names.push("BOUNCE_ON_ACTION_FAIL");
-        }
-        if flags.contains(SendMsgFlags::DELETE_IF_EMPTY) {
-            flag_names.push("DESTROY");
-        }
-        if flags.contains(SendMsgFlags::WITH_REMAINING_BALANCE) {
-            flag_names.push("CARRY_ALL_REMAINING_MESSAGE_VALUE");
-        }
-        if flags.contains(SendMsgFlags::ALL_BALANCE) {
-            flag_names.push("CARRY_ALL_BALANCE");
+
+        let known = u32::from(SendMsgFlags::all().bits())
+            | if include_estimate_fee_only { 1024 } else { 0 };
+        let unknown = mode & !known;
+        if unknown != 0 {
+            flag_names.push(format!("0x{unknown:x}"));
         }
 
         if flag_names.is_empty() {
-            "REGULAR".to_string()
+            format!("{prefix}REGULAR")
         } else {
             flag_names.join(" | ")
         }
+    }
+
+    #[must_use]
+    pub fn format_send_mode_constants(mode: u32) -> String {
+        Self::format_send_mode_parts(mode, "SEND_MODE_", true)
     }
 
     #[must_use]
@@ -2822,22 +2925,8 @@ impl FormatterContext<'_> {
         if let Some(ref dp) = assert_failure.params.opcode {
             match dp {
                 DisplayParam::Value(opcode) => {
-                    let opcode_type = assert_failure
-                        .params
-                        .to
-                        .as_ref()
-                        .and_then(|dp| match dp {
-                            DisplayParam::Value(addr) => Some(addr),
-                            DisplayParam::Function => None,
-                        })
-                        .or_else(|| {
-                            assert_failure.params.from.as_ref().and_then(|dp| match dp {
-                                DisplayParam::Value(addr) => Some(addr),
-                                DisplayParam::Function => None,
-                            })
-                        })
-                        .and_then(|addr| self.build_result_for_address(Some(addr)))
-                        .and_then(|build| Self::message_name_from_build(&build, *opcode));
+                    let opcode_type =
+                        self.message_name_from_search_params(*opcode, &assert_failure.params);
                     params.push(format!(
                         "  opcode={} {}",
                         format!("0x{opcode:08x}").green(),
@@ -2866,6 +2955,18 @@ impl FormatterContext<'_> {
         push_param!(bool "aborted", assert_failure.params.aborted);
         push_param!(int "exit_code", assert_failure.params.exit_code);
         push_param!(int "action_exit_code", assert_failure.params.action_exit_code);
+        match &assert_failure.params.send_mode {
+            Some(DisplayParam::Value(mode)) => {
+                params.push(format!(
+                    "  send_mode={}",
+                    Self::format_send_mode_constants(*mode).green()
+                ));
+            }
+            Some(DisplayParam::Function) => {
+                params.push(format!("  send_mode={}", "<function>".cyan()));
+            }
+            None => {}
+        }
         push_param!(bool "compute_phase_skipped", assert_failure.params.compute_phase_skipped);
         match &assert_failure.params.body {
             Some(DisplayParam::Value(body)) => {
@@ -2927,6 +3028,40 @@ impl FormatterContext<'_> {
         code.to_string()
     }
 
+    fn format_missing_libraries_help_lines(
+        missing_libraries: impl IntoIterator<Item = String>,
+    ) -> Vec<String> {
+        let mut missing_libraries = missing_libraries.into_iter().collect::<Vec<_>>();
+        missing_libraries.sort_unstable();
+
+        if missing_libraries.is_empty() {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        if missing_libraries.len() == 1 {
+            lines.push(format!(
+                "Library {} is missing, which is what causes this error",
+                missing_libraries.join(", ").yellow()
+            ));
+        } else {
+            lines.push(format!(
+                "Missing libraries: {}",
+                missing_libraries.join(", ").yellow()
+            ));
+        }
+        lines.push(
+            "This most likely happened because the library is not registered in tests".to_owned(),
+        );
+        lines.push(format!(
+            "To manually register library use {} somewhere in {}-like function",
+            "testing.registerLibrary(code)".yellow(),
+            "setupTests()".yellow(),
+        ));
+        lines.push("Learn more about libraries in documentation: https://ton-blockchain.github.io/acton/docs/libraries".to_owned());
+        lines
+    }
+
     #[must_use]
     pub fn format_get_method_assert_failure_title(failure: &GetMethodAssertFailure) -> String {
         if failure.vm_exit_code == 11 {
@@ -2959,7 +3094,9 @@ impl FormatterContext<'_> {
     pub fn format_get_method_assert_failure(&self, failure: &GetMethodAssertFailure) -> String {
         let mut output = Self::format_get_method_assert_failure_title(failure);
 
-        if failure.vm_exit_code == 11 || failure.vm_exit_code == 2 {
+        if (failure.vm_exit_code == 11 || failure.vm_exit_code == 2)
+            && failure.missing_libraries.is_empty()
+        {
             return output;
         }
 
@@ -2970,6 +3107,12 @@ impl FormatterContext<'_> {
             failure.vm_exit_code.to_string().yellow()
         )
         .ok();
+
+        for line in
+            Self::format_missing_libraries_help_lines(failure.missing_libraries.iter().cloned())
+        {
+            writeln!(details, "{line}").ok();
+        }
 
         let replayed_exception = retrace::find_exception_info(&failure.vm_log, &failure.source_map);
 
@@ -3280,6 +3423,34 @@ impl FormatterContext<'_> {
                     for param in params {
                         writeln!(result, "  {param}").ok();
                     }
+                }
+            }
+            AssertFailure::ExternalSendNotAccepted(external_failure) => {
+                writeln!(
+                    result,
+                    "Error: {}",
+                    Self::highlight_actual_expected(&external_failure.message)
+                )
+                .ok();
+                let status = if external_failure.external_not_accepted {
+                    "external message was not accepted"
+                } else {
+                    "external send failed before producing transactions"
+                };
+                writeln!(result, "Status: {status}").ok();
+                writeln!(result, "Reason: {}", external_failure.reason).ok();
+                if let Some((label, description)) =
+                    self.format_external_not_accepted_vm_result(external_failure)
+                {
+                    writeln!(result, "{label} {description}").ok();
+                }
+                if !external_failure.missing_libraries.is_empty() {
+                    writeln!(
+                        result,
+                        "Missing libraries: {}",
+                        external_failure.missing_libraries.join(", ")
+                    )
+                    .ok();
                 }
             }
             AssertFailure::WalletNotFound(failure) => {

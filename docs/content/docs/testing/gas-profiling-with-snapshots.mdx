@@ -3,7 +3,7 @@ title: "Gas profiling with snapshots"
 description: "Learn how to profile gas and fees of transaction chains with --snapshot and baseline comparison"
 ---
 
-Gas profiling records gas and fee metrics for opcodes. Performance regressions show up in the `--snapshot` and `--baseline-snapshot` outputs.
+Gas profiling records gas and fee metrics for message opcodes and transaction chains. Performance regressions show up in the `--snapshot` and `--baseline-snapshot` outputs.
 
 ## What gets profiled
 
@@ -15,6 +15,8 @@ When profiling is enabled, Acton prints:
 
 For chain-level metrics, Acton tracks: transaction count, gas used, gas fee, forward fee, and the total fee.
 
+Profiling is collected after the selected tests pass. If any selected test fails, Acton skips snapshot writing and comparison tables for that run.
+
 ## Quick start
 
 ### Create a baseline snapshot
@@ -25,7 +27,7 @@ acton test --snapshot gas-baseline.json
 
 This runs tests and writes a JSON snapshot of opcode and trace-chain statistics:
 
-```acton-gas-report noCopy
+```acton-gas-report noCopy title="terminal"
  GAS USAGE
 
 ───────────────────────────────────────────────
@@ -53,7 +55,7 @@ acton test --baseline-snapshot gas-baseline.json
 
 This prints comparison tables with diffs for opcode gas and chain metrics.
 
-```acton-gas-report noCopy
+```acton-gas-report noCopy title="terminal"
  GAS USAGE COMPARISON
 
 Baseline: gas-baseline.json (3 opcodes, captured 2026-02-28 14:49:39 UTC)
@@ -81,7 +83,7 @@ Baseline: gas-baseline.json (14 traces, captured 2026-02-28 14:49:39 UTC)
  test unknown message         5    5       2568    0.0010272 TON    0.0010272 TON
 ```
 
-```acton-gas-report noCopy
+```acton-gas-report noCopy title="terminal"
  CHAIN GAS & FEES · test increase counter
 
 ────────────────────────────────────────────────────────────────────────────────────────────
@@ -217,18 +219,13 @@ acton test tests/wallet.test.tolk --baseline-snapshot gas-baseline.json
 
 ## Troubleshooting
 
-### Baseline file missing or invalid
-
-Default behavior: Acton prints a warning and continues without baseline comparison.
-
-With strict mode, i.e., `--fail-on-diff` or `[test].fail-on-diff = true`, Acton exits with error.
-
 ### Snapshot file was not created
 
 Snapshot is written only when:
 
 - `--snapshot` is set;
 - `--baseline-snapshot` is **not** set;
+- selected tests passed;
 - profiling collected at least one opcode or trace-chain metric.
 
 ### Trace names changed but diff mapping is still stable

@@ -117,6 +117,17 @@ pub struct FaucetRequest {
 }
 
 #[derive(Deserialize)]
+pub struct StatePathRequest {
+    pub path: String,
+}
+
+#[derive(Deserialize)]
+pub struct SetShardAccountRequest {
+    pub address: String,
+    pub shard_account: String,
+}
+
+#[derive(Deserialize)]
 pub struct GetTracesQuery {
     #[serde(alias = "hash")]
     pub tx_hash: Option<String>,

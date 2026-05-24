@@ -8,6 +8,8 @@ use reqwest::blocking::Client;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::fs;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpListener;
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -743,7 +745,7 @@ fn localnet_can_rate_limit_api_endpoints_to_simulate_provider_limits() {
         serde_json::to_string_pretty(&rate_limited).unwrap_or_default()
     );
 
-    let (admin_status, admin_response) = node.get_json_with_status("/admin/state-source");
+    let (admin_status, admin_response) = node.get_json_with_status("/acton_nodeInfo");
     assert_eq!(
         admin_status, 200,
         "Admin endpoints must stay available when API rate-limit is enabled"
@@ -759,6 +761,387 @@ fn localnet_can_rate_limit_api_endpoints_to_simulate_provider_limits() {
         "Expected API requests to recover after rate-limit window"
     );
     assert_eq!(api_after_window["ok"].as_bool(), Some(true));
+
+    node.stop();
+}
+
+#[test]
+fn localnet_status_json_reports_running_node_details() {
+    let project = ProjectBuilder::new("localnet-status-running").build();
+    let node = project.localnet().start();
+    let output = project
+        .acton()
+        .arg("localnet")
+        .arg("status")
+        .arg("--json")
+        .arg("--port")
+        .arg(&node.port().to_string())
+        .run()
+        .success();
+
+    let mut payload: Value =
+        serde_json::from_str(&output.get_stdout()).expect("status --json must return valid JSON");
+    normalize_localnet_status_json(&mut payload, node.port());
+    assertion().eq(
+        pretty_json_for_snapshot(&payload, project.path()),
+        snapbox::file!("snapshots/localnet/test_localnet_status_json_running.response.json"),
+    );
+
+    node.stop();
+}
+
+#[test]
+fn localnet_status_human_reports_running_node_details() {
+    let project = ProjectBuilder::new("localnet-status-human-running").build();
+    let node = project.localnet().start();
+    let output = project
+        .acton()
+        .arg("localnet")
+        .arg("status")
+        .arg("--port")
+        .arg(&node.port().to_string())
+        .run()
+        .success();
+
+    assertion().eq(
+        normalize_localnet_status_stdout(&strip_ansi(&output.get_stdout()), node.port()),
+        snapbox::file!("snapshots/localnet/test_localnet_status_human_running.stdout.txt"),
+    );
+
+    node.stop();
+}
+
+#[test]
+fn localnet_status_json_reports_stopped_node() {
+    let project = ProjectBuilder::new("localnet-status-stopped").build();
+    let node = project.localnet().start();
+    let port = node.port();
+    node.stop();
+
+    let output = project
+        .acton()
+        .arg("localnet")
+        .arg("status")
+        .arg("--json")
+        .arg("--port")
+        .arg(&port.to_string())
+        .run()
+        .success();
+
+    let mut payload: Value =
+        serde_json::from_str(&output.get_stdout()).expect("status --json must return valid JSON");
+    normalize_localnet_status_json(&mut payload, port);
+    assertion().eq(
+        pretty_json_for_snapshot(&payload, project.path()),
+        snapbox::file!("snapshots/localnet/test_localnet_status_json_stopped.response.json"),
+    );
+}
+
+#[test]
+fn localnet_status_json_reports_stopped_for_non_localnet_http_server() {
+    let project = ProjectBuilder::new("localnet-status-non-localnet-http").build();
+    let listener = TcpListener::bind("127.0.0.1:0").expect("failed to bind fake status server");
+    listener
+        .set_nonblocking(true)
+        .expect("failed to make fake status server non-blocking");
+    let port = listener
+        .local_addr()
+        .expect("failed to resolve fake status server address")
+        .port();
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request);
+                    let body = "<html>not an acton localnet</html>";
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("failed to write fake status response");
+                    return;
+                }
+                Err(err) if err.kind() == ErrorKind::WouldBlock && Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => panic!("failed to accept fake status request: {err}"),
+            }
+        }
+    });
+
+    let output = project
+        .acton()
+        .arg("localnet")
+        .arg("status")
+        .arg("--json")
+        .arg("--port")
+        .arg(&port.to_string())
+        .run()
+        .success();
+    server
+        .join()
+        .expect("fake status server thread must finish");
+
+    let mut payload: Value =
+        serde_json::from_str(&output.get_stdout()).expect("status --json must return valid JSON");
+    normalize_localnet_status_json(&mut payload, port);
+    assertion().eq(
+        pretty_json_for_snapshot(&payload, project.path()),
+        snapbox::file!(
+            "snapshots/localnet/test_localnet_status_json_non_localnet_http.response.json"
+        ),
+    );
+}
+
+#[test]
+fn localnet_admin_dump_and_load_state_roundtrip() {
+    let project = ProjectBuilder::new("localnet-admin-state-roundtrip").build();
+    let node = project.localnet().start();
+    let snapshot_path = project.path().join("localnet-state.json");
+    let address_before = "0:1111111111111111111111111111111111111111111111111111111111111111";
+    let address_after = "0:2222222222222222222222222222222222222222222222222222222222222222";
+
+    let funded_before = node.post_json(
+        "/acton_fundAccount",
+        &json!({
+            "address": address_before,
+            "amount": 1_000_000_000u128,
+        }),
+    );
+
+    let before_info = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={address_before}"),
+        Duration::from_secs(5),
+    );
+    let before_balance = parse_address_balance(&before_info);
+
+    let dumped = node.post_json(
+        "/acton_dumpState",
+        &json!({
+            "path": snapshot_path.display().to_string(),
+        }),
+    );
+
+    let funded_after = node.post_json(
+        "/acton_fundAccount",
+        &json!({
+            "address": address_after,
+            "amount": 2_000_000_000u128,
+        }),
+    );
+
+    let after_info = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={address_after}"),
+        Duration::from_secs(5),
+    );
+    let after_balance_before_load = parse_address_balance(&after_info);
+
+    let loaded = node.post_json(
+        "/acton_loadState",
+        &json!({
+            "path": snapshot_path.display().to_string(),
+        }),
+    );
+
+    let before_info_reloaded = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={address_before}"),
+        Duration::from_secs(5),
+    );
+    let before_balance_after_load = parse_address_balance(&before_info_reloaded);
+
+    let after_info_reloaded = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={address_after}"),
+        Duration::from_secs(5),
+    );
+    let after_balance_after_load = parse_address_balance(&after_info_reloaded);
+
+    let snapshot = json!({
+        "fund_before": summarize_admin_response(&funded_before),
+        "dump": summarize_admin_response(&dumped),
+        "snapshot_file_created": snapshot_path.is_file(),
+        "fund_after": summarize_admin_response(&funded_after),
+        "load": summarize_admin_response(&loaded),
+        "balances": {
+            "before_after_fund": before_balance.to_string(),
+            "after_after_fund": after_balance_before_load.to_string(),
+            "before_after_load": before_balance_after_load.to_string(),
+            "after_after_load": after_balance_after_load.to_string(),
+        }
+    });
+
+    assertion().eq(
+        pretty_json_for_snapshot(&snapshot, project.path()),
+        snapbox::file!(
+            "snapshots/localnet/test_localnet_admin_dump_and_load_state_roundtrip.summary.json"
+        ),
+    );
+
+    node.stop();
+}
+
+#[test]
+fn localnet_admin_set_shard_account_updates_selected_account() {
+    let project = ProjectBuilder::new("localnet-admin-set-shard-account").build();
+    let node = project.localnet().start();
+    let source = "0:1111111111111111111111111111111111111111111111111111111111111111";
+    let target = "0:2222222222222222222222222222222222222222222222222222222222222222";
+
+    let fund = node.post_json(
+        "/acton_fundAccount",
+        &json!({
+            "address": source,
+            "amount": 1_000_000_000u128,
+        }),
+    );
+    let source_info = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={source}"),
+        Duration::from_secs(5),
+    );
+    let source_balance = parse_address_balance(&source_info);
+    let source_shard_response = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getShardAccountCell?address={source}"),
+        Duration::from_secs(5),
+    );
+    let source_shard_boc = shard_account_cell_boc64(&source_shard_response).to_owned();
+
+    let set = node.post_json(
+        "/acton_setShardAccount",
+        &json!({
+            "address": target,
+            "shard_account": source_shard_boc,
+        }),
+    );
+    let target_info_after_set = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={target}"),
+        Duration::from_secs(5),
+    );
+    let target_balance_after_set = parse_address_balance(&target_info_after_set);
+    let target_shard_response = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getShardAccountCell?address={target}"),
+        Duration::from_secs(5),
+    );
+    let target_shard_boc = shard_account_cell_boc64(&target_shard_response).to_owned();
+
+    let invalid = node.post_json(
+        "/acton_setShardAccount",
+        &json!({
+            "address": target,
+            "shard_account": "not-a-boc",
+        }),
+    );
+
+    let snapshot = json!({
+        "fund": summarize_admin_response(&fund),
+        "set": summarize_admin_response(&set),
+        "source_balance": source_balance.to_string(),
+        "target_balance_after_set": target_balance_after_set.to_string(),
+        "target_cell_matches_source": target_shard_boc == source_shard_boc,
+        "target_after_set": summarize_shard_account_cell_response(&target_shard_response, None),
+        "invalid": summarize_admin_response(&invalid),
+    });
+
+    assertion().eq(
+        pretty_json_for_snapshot(&snapshot, project.path()),
+        snapbox::file!(
+            "snapshots/localnet/test_localnet_admin_set_shard_account_updates_selected_account.summary.json"
+        ),
+    );
+
+    node.stop();
+}
+
+#[test]
+fn localnet_raw_internal_messages_use_acton_endpoint() {
+    let project = ProjectBuilder::new("localnet-raw-internal-message").build();
+    let node = project.localnet().start();
+    let internal_boc = build_localnet_internal_boc();
+    let target = "0:2222222222222222222222222222222222222222222222222222222222222222";
+
+    let send_boc = node.post_json(
+        "/api/v2/sendBoc",
+        &json!({
+            "boc": internal_boc,
+        }),
+    );
+    let send_boc_return_hash = node.post_json(
+        "/api/v2/sendBocReturnHash",
+        &json!({
+            "boc": internal_boc,
+        }),
+    );
+    let (json_rpc_send_boc_status, json_rpc_send_boc) = node.post_json_with_status(
+        "/api/v2/jsonRPC",
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "send",
+            "method": "sendBoc",
+            "params": {
+                "boc": internal_boc,
+            },
+        }),
+    );
+    let (json_rpc_send_boc_return_hash_status, json_rpc_send_boc_return_hash) = node
+        .post_json_with_status(
+            "/api/v2/jsonRPC",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "send-return-hash",
+                "method": "sendBocReturnHash",
+                "params": {
+                    "boc": internal_boc,
+                },
+            }),
+        );
+    let (message_status, message) = node.post_json_with_status(
+        "/api/v3/message",
+        &json!({
+            "boc": internal_boc,
+        }),
+    );
+    let acton_send = node.post_json(
+        "/acton_sendInternalMessage",
+        &json!({
+            "boc": internal_boc,
+        }),
+    );
+    let target_info = wait_for_ok_response(
+        &node,
+        &format!("/api/v2/getAddressInformation?address={target}"),
+        Duration::from_secs(5),
+    );
+
+    let snapshot = json!({
+        "send_boc": summarize_admin_response(&send_boc),
+        "send_boc_return_hash": summarize_admin_response(&send_boc_return_hash),
+        "json_rpc_send_boc_status": json_rpc_send_boc_status,
+        "json_rpc_send_boc": summarize_admin_response(&json_rpc_send_boc),
+        "json_rpc_send_boc_return_hash_status": json_rpc_send_boc_return_hash_status,
+        "json_rpc_send_boc_return_hash": summarize_admin_response(&json_rpc_send_boc_return_hash),
+        "message_status": message_status,
+        "message": message,
+        "acton_send": summarize_admin_response(&acton_send),
+        "target_balance": parse_address_balance(&target_info).to_string(),
+    });
+
+    assertion().eq(
+        pretty_json_for_snapshot(&snapshot, project.path()),
+        snapbox::file!(
+            "snapshots/localnet/test_localnet_raw_internal_messages_use_acton_endpoint.summary.json"
+        ),
+    );
 
     node.stop();
 }
@@ -1880,7 +2263,7 @@ fn localnet_supports_v3_transactions_endpoints() {
         V3_TRANSACTIONS_TEST_ACCOUNT_B,
     ] {
         let faucet = node.post_json(
-            "/admin/faucet",
+            "/acton_fundAccount",
             &json!({
                 "address": address,
                 "amount": 250_000_000u128
@@ -2734,7 +3117,7 @@ fn localnet_registers_and_serves_compiler_abi_for_localnet_deploys() {
 
     let abi_response = wait_for_ok_response(
         &node,
-        &format!("/admin/compiler-abi?code_hash={code_hash_hex}"),
+        &format!("/acton_getCompilerAbi?code_hash={code_hash_hex}"),
         Duration::from_secs(12),
     );
     let abi = response_payload(&abi_response);
@@ -2752,7 +3135,7 @@ fn localnet_registers_and_serves_compiler_abi_for_localnet_deploys() {
     );
 
     let missing_response = node.get_json(
-        "/admin/compiler-abi?code_hash=1111111111111111111111111111111111111111111111111111111111111111",
+        "/acton_getCompilerAbi?code_hash=1111111111111111111111111111111111111111111111111111111111111111",
     );
     assert_eq!(missing_response["ok"].as_bool(), Some(true));
     assert!(
@@ -2897,6 +3280,71 @@ fn response_payload(response: &Value) -> &Value {
             serde_json::to_string_pretty(response).unwrap_or_default()
         )
     }
+}
+
+fn pretty_json_for_snapshot(value: &Value, project_path: &Path) -> String {
+    let response_json = format!(
+        "{}\n",
+        serde_json::to_string_pretty(value).expect("Failed to serialize JSON snapshot")
+    );
+    normalize_output_preserve_escapes(&response_json, project_path)
+}
+
+fn normalize_localnet_status_json(payload: &mut Value, expected_port: u16) {
+    match payload.get_mut("port").and_then(|value| value.as_u64()) {
+        Some(port) if port == u64::from(expected_port) => {
+            payload["port"] = json!("[PORT]");
+        }
+        _ => panic!(
+            "Expected localnet status port {expected_port}, got:\n{}",
+            serde_json::to_string_pretty(payload).unwrap_or_default()
+        ),
+    }
+
+    match payload.get_mut("uptime_seconds") {
+        Some(value) if value.as_u64().is_some() => {
+            *value = json!("[UPTIME_SECONDS]");
+        }
+        Some(value) if value.is_null() => {}
+        _ => panic!(
+            "Expected localnet status uptime_seconds to be a number or null, got:\n{}",
+            serde_json::to_string_pretty(payload).unwrap_or_default()
+        ),
+    }
+}
+
+fn normalize_localnet_status_stdout(stdout: &str, port: u16) -> String {
+    let port_fragment = format!("127.0.0.1:{port}");
+    let normalized = stdout.replace(&port_fragment, "127.0.0.1:[PORT]");
+    let mut lines = normalized
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("Uptime: ") {
+                let indent = &line[..line.len() - trimmed.len()];
+                format!("{indent}Uptime: [UPTIME_SECONDS]s")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.ends_with('\n') {
+        lines.push('\n');
+    }
+    lines
+}
+
+fn summarize_admin_response(response: &Value) -> Value {
+    let mut response = response.clone();
+    normalize_extra_for_snapshot(&mut response);
+    if let Some(tx_hash) = response.pointer_mut("/result/result/tx_hash") {
+        *tx_hash = json!("[HASH]");
+    }
+    if let Some(hash) = response.pointer_mut("/result/hash") {
+        *hash = json!("[HASH]");
+    }
+    response
 }
 
 fn wait_for_ok_response(
@@ -3079,25 +3527,7 @@ fn build_localnet_ext_in_boc() -> String {
         TonWallet::new_with_params(version, key_pair, 0, wallet_id).expect("wallet must build");
 
     let wallet_addr = ton_address_to_std_addr(&wallet.address);
-    let message = OwnedMessage {
-        info: MsgInfo::Int(IntMsgInfo {
-            ihr_disabled: true,
-            bounce: false,
-            bounced: false,
-            src: IntAddr::Std(wallet_addr.clone()),
-            dst: IntAddr::Std(wallet_addr),
-            value: CurrencyCollection::new(50_000_000),
-            ihr_fee: Default::default(),
-            fwd_fee: Default::default(),
-            created_at: 0,
-            created_lt: 0,
-        }),
-        init: None,
-        body: CellSliceParts::from(CellBuilder::new().build().expect("must build empty body")),
-        layout: None,
-    };
-
-    let internal_boc = BocRepr::encode(message).expect("must encode internal message boc");
+    let internal_boc = build_internal_message_boc(wallet_addr.clone(), wallet_addr, 50_000_000);
     let internal_cell = TonCell::from_boc(internal_boc).expect("must decode internal TonCell");
     let expire_at = (SystemTime::now() + Duration::from_secs(600))
         .duration_since(UNIX_EPOCH)
@@ -3108,6 +3538,43 @@ fn build_localnet_ext_in_boc() -> String {
         .expect("must build external-in message")
         .to_boc_base64()
         .expect("must encode external-in message boc")
+}
+
+fn build_localnet_internal_boc() -> String {
+    let source = test_std_addr(0x11);
+    let target = test_std_addr(0x22);
+    base64::engine::general_purpose::STANDARD
+        .encode(build_internal_message_boc(source, target, 50_000_000))
+}
+
+fn build_internal_message_boc(source: StdAddr, target: StdAddr, value: u128) -> Vec<u8> {
+    let message = OwnedMessage {
+        info: MsgInfo::Int(IntMsgInfo {
+            ihr_disabled: true,
+            bounce: false,
+            bounced: false,
+            src: IntAddr::Std(source),
+            dst: IntAddr::Std(target),
+            value: CurrencyCollection::new(value),
+            ihr_fee: Default::default(),
+            fwd_fee: Default::default(),
+            created_at: 0,
+            created_lt: 0,
+        }),
+        init: None,
+        body: CellSliceParts::from(CellBuilder::new().build().expect("must build empty body")),
+        layout: None,
+    };
+
+    BocRepr::encode(message).expect("must encode internal message boc")
+}
+
+fn test_std_addr(byte: u8) -> StdAddr {
+    StdAddr {
+        anycast: None,
+        address: HashBytes([byte; 32]),
+        workchain: 0,
+    }
 }
 
 fn compute_message_hashes_base64(boc_b64: &str) -> (String, String) {

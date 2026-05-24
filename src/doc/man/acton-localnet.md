@@ -25,7 +25,7 @@ Start the local TON network.
 
 #### Options
 
-{{#options}}
+{{#options command="acton localnet start"}}
 
 {{#option "`--port` _port_" }}
 Localnet server port.
@@ -73,7 +73,7 @@ Send TON from the local faucet to an address.
 
 #### Options
 
-{{#options}}
+{{#options command="acton localnet airdrop"}}
 
 {{#option "_address_" }}
 Recipient address.
@@ -85,6 +85,28 @@ Amount of TON to request.
 
 {{#option "`-p`, `--port` _port_" }}
 Localnet server port.
+{{/option}}
+
+{{/options}}
+
+### acton localnet status
+
+Inspect the current localnet status.
+
+#### Synopsis
+
+`acton localnet status` [_options_]
+
+#### Options
+
+{{#options command="acton localnet status"}}
+
+{{#option "`-p`, `--port` _port_" }}
+Localnet server port.
+{{/option}}
+
+{{#option "`--json`" }}
+Print machine-readable JSON.
 {{/option}}
 
 {{/options}}
@@ -123,21 +145,47 @@ one-off overrides or CI.
 
 - fork mode allows local development against remote chain state
 - `acton localnet start` runs in the foreground until the process is stopped
-- Acton starts an HTTP server on `localhost:<port>` for localnet API, admin
+- Acton starts an HTTP server on `127.0.0.1:<port>` for localnet API, control
   endpoints, and the bundled localnet UI
 - the server keeps running until the process is stopped, for example with
   `Ctrl+C`
 - the Localnet UI is available on the root path, for example
-  `http://localhost:<port>/`
+  `http://127.0.0.1:<port>/`
 - the bundled UI is a single-page explorer app, so routes like `/explorer`,
   `/tokens`, `/nfts`, and per-address or per-transaction pages are served from
   the same frontend shell
-- the UI reads chain data from `/api/v2` and `/api/v3`, and uses `/admin`
-  lookups for local address aliases and registered compiler ABIs
+- the UI reads chain data from `/api/v2` and `/api/v3`, and uses `acton_*`
+  control endpoints for local address aliases, registered compiler ABIs,
+  status, and snapshot tooling
 - when `--port` and `[localnet].port` are both absent, the current runtime
   fallback is `5411`
 - `--rate-limit` applies to `/api/*` endpoints, not admin endpoints
 - `--dump-state` writes a snapshot during graceful shutdown
+
+## Control Endpoints
+
+The localnet server exposes `acton_*` control routes for local development
+tooling:
+
+- `GET /acton_nodeInfo` returns uptime, latest block seqno, and the active state
+  source
+- `POST /acton_dumpState` with `{"path":"snapshots/localnet.json"}` writes a
+  JSON state snapshot without stopping the server
+- `POST /acton_loadState` with `{"path":"snapshots/localnet.json"}` replaces
+  the current node state with a JSON state snapshot
+- `POST /acton_setShardAccount` with
+  `{"address":"<ADDR>","shard_account":"<BASE64_BOC>"}` replaces the selected
+  account state with a base64-encoded `ShardAccount` BOC
+- `POST /acton_sendInternalMessage` with `{"boc":"<BASE64_BOC>"}` sends a
+  base64-encoded internal message BOC through the local internal queue
+
+TonCenter-compatible message endpoints such as `/api/v2/sendBoc` and
+`/api/v3/message` accept external-in messages only. Use
+`/acton_sendInternalMessage` when local tooling needs to inject a raw internal
+message.
+
+Control endpoints are not authenticated and are intended only for local
+development. Do not expose the localnet server publicly.
 
 ## Persistence
 
@@ -149,9 +197,11 @@ one-off overrides or CI.
 
 ## Exit Status
 
-- `0`: The selected localnet subcommand completed successfully.
+- `0`: The selected localnet subcommand completed successfully. For
+  `acton localnet status`, this also includes the selected port not running;
+  use `--json` and inspect `running` for automation.
 - `1`: Startup failed because port binding, state loading, remote fork
-  initialization, or faucet handling failed.
+  initialization, faucet handling, or a status/control query failed.
 
 ## Display Options
 
@@ -191,6 +241,12 @@ one-off overrides or CI.
 
    ```bash
    acton localnet start --accounts deployer,user --db-path build/localnet.db
+   ```
+
+6. Inspect a running localnet:
+
+   ```bash
+   acton localnet status --json
    ```
 
 ## See Also

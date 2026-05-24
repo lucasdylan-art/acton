@@ -116,10 +116,10 @@ pub enum ContractDependency {
 #[serde(deny_unknown_fields)]
 pub struct CustomNetworkApiConfig {
     /// The URL for the `TonCenter` API v2. For localnet this defaults to
-    /// `http://localhost:<localnet.port>/api/v2` with `5411` as the fallback port
+    /// `http://127.0.0.1:<localnet.port>/api/v2` with `5411` as the fallback port
     pub v2: Option<String>,
     /// The URL for the `TonCenter` API v3. For localnet this defaults to
-    /// `http://localhost:<localnet.port>/api/v3` with `5411` as the fallback port
+    /// `http://127.0.0.1:<localnet.port>/api/v3` with `5411` as the fallback port
     pub v3: Option<String>,
 }
 
@@ -603,6 +603,8 @@ pub struct ContractConfig {
     pub name: Option<String>,
     /// Path to the contract source (`.tolk`) or precompiled (`.boc`) file
     pub src: String,
+    /// Optional Tolk interface file used to produce ABI for precompiled `.boc` contracts
+    pub types: Option<String>,
     /// Dependencies of this contract
     pub depends: Option<Vec<ContractDependency>>,
     /// Path where the compiled `.boc` should be saved
@@ -713,6 +715,20 @@ impl ContractConfig {
             Ok(path) => path.into_owned(),
             Err(_) => Path::new(self.src.as_str()).to_path_buf(),
         }
+    }
+
+    /// Returns the optional contract interface file resolved relative to the project root.
+    /// If `types` is already absolute, it is returned as-is.
+    #[must_use]
+    pub fn absolute_types_path(&self, project_root: &Path) -> Option<PathBuf> {
+        let types = self
+            .types
+            .as_deref()
+            .filter(|types| !types.trim().is_empty())?;
+        Some(match Path::new(types).absolutize_from(project_root) {
+            Ok(path) => path.into_owned(),
+            Err(_) => Path::new(types).to_path_buf(),
+        })
     }
 }
 
@@ -885,8 +901,8 @@ impl ActonConfig {
             .as_ref()
             .and_then(|cfg| cfg.port)
             .unwrap_or(5411);
-        let default_localnet_v2 = format!("http://localhost:{localnet_port}/api/v2");
-        let default_localnet_v3 = format!("http://localhost:{localnet_port}/api/v3");
+        let default_localnet_v2 = format!("http://127.0.0.1:{localnet_port}/api/v2");
+        let default_localnet_v3 = format!("http://127.0.0.1:{localnet_port}/api/v3");
 
         let localnet_config = self
             .networks
@@ -1649,6 +1665,7 @@ rules-file = "mutation-rules.json"
                     ContractConfig {
                         name: Some("Counter Contract".to_string()),
                         src: "counter.tolk".to_string(),
+                        types: None,
                         depends: Some(vec![]),
                         output: None,
                     },
@@ -1713,8 +1730,8 @@ description = "Test project"
 version = "0.1.0"
 
 [networks.localnet]
-api = { v2 = "http://localhost:3010/api/v2/", v3 = "http://localhost:3010/api/v3/" }
-explorer = "http://localhost:3010/explorer/"
+api = { v2 = "http://127.0.0.1:3010/api/v2/", v3 = "http://127.0.0.1:3010/api/v3/" }
+explorer = "http://127.0.0.1:3010/explorer/"
 
 [networks.my-custom]
 api = { v2 = "https://example.com/api/v2/" }
@@ -1726,14 +1743,14 @@ api = { v2 = "https://example.com/api/v2/" }
         let localnet = networks
             .get("localnet")
             .expect("localnet config should be present");
-        assert_eq!(localnet.v2_url.as_ref(), "http://localhost:3010/api/v2");
+        assert_eq!(localnet.v2_url.as_ref(), "http://127.0.0.1:3010/api/v2");
         assert_eq!(
             localnet.v3_url.as_deref(),
-            Some("http://localhost:3010/api/v3")
+            Some("http://127.0.0.1:3010/api/v3")
         );
         assert_eq!(
             localnet.explorer_url.as_deref(),
-            Some("http://localhost:3010/explorer")
+            Some("http://127.0.0.1:3010/explorer")
         );
 
         let custom = networks
@@ -1756,7 +1773,7 @@ version = "0.1.0"
 port = 3015
 
 [networks.localnet]
-explorer = "http://localhost:3015/explorer"
+explorer = "http://127.0.0.1:3015/explorer"
 "#;
 
         let config: ActonConfig = toml::from_str(toml_content).unwrap();
@@ -1765,14 +1782,14 @@ explorer = "http://localhost:3015/explorer"
             .get("localnet")
             .expect("localnet config should always be present");
 
-        assert_eq!(localnet.v2_url.as_ref(), "http://localhost:3015/api/v2");
+        assert_eq!(localnet.v2_url.as_ref(), "http://127.0.0.1:3015/api/v2");
         assert_eq!(
             localnet.v3_url.as_deref(),
-            Some("http://localhost:3015/api/v3")
+            Some("http://127.0.0.1:3015/api/v3")
         );
         assert_eq!(
             localnet.explorer_url.as_deref(),
-            Some("http://localhost:3015/explorer")
+            Some("http://127.0.0.1:3015/explorer")
         );
     }
 
@@ -1791,10 +1808,10 @@ version = "0.1.0"
             .get("localnet")
             .expect("localnet config should always be present");
 
-        assert_eq!(localnet.v2_url.as_ref(), "http://localhost:5411/api/v2");
+        assert_eq!(localnet.v2_url.as_ref(), "http://127.0.0.1:5411/api/v2");
         assert_eq!(
             localnet.v3_url.as_deref(),
-            Some("http://localhost:5411/api/v3")
+            Some("http://127.0.0.1:5411/api/v3")
         );
         assert_eq!(localnet.explorer_url, None);
     }
@@ -1808,7 +1825,7 @@ description = "Test project"
 version = "0.1.0"
 
 [networks.localnet]
-v2-url = "http://localhost:3010/api/v2"
+v2-url = "http://127.0.0.1:3010/api/v2"
 "#;
 
         let err = toml::from_str::<ActonConfig>(toml_content).expect_err("legacy key must fail");

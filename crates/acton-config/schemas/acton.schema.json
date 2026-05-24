@@ -201,6 +201,10 @@
         "src": {
           "description": "Path to the contract source (`.tolk`) or precompiled (`.boc`) file",
           "type": "string"
+        },
+        "types": {
+          "description": "Optional Tolk interface file used to produce ABI for precompiled `.boc` contracts",
+          "type": "string"
         }
       }
     },
@@ -273,11 +277,11 @@
       "type": "object",
       "properties": {
         "v2": {
-          "description": "The URL for the `TonCenter` API v2. For localnet this defaults to `http://localhost:<localnet.port>/api/v2` with `5411` as the fallback port",
+          "description": "The URL for the `TonCenter` API v2. For localnet this defaults to `http://127.0.0.1:<localnet.port>/api/v2` with `5411` as the fallback port",
           "type": "string"
         },
         "v3": {
-          "description": "The URL for the `TonCenter` API v3. For localnet this defaults to `http://localhost:<localnet.port>/api/v3` with `5411` as the fallback port",
+          "description": "The URL for the `TonCenter` API v3. For localnet this defaults to `http://127.0.0.1:<localnet.port>/api/v3` with `5411` as the fallback port",
           "type": "string"
         }
       },

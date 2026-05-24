@@ -17,7 +17,6 @@
 ///   fail at runtime with a parser error that includes a byte offset.
 /// - For non-int arguments, `{:x}` and `{:ton}` fall back to default formatting.
 /// - For non-cell/slice/builder/Cell<T> arguments, `{:cell-tree}` falls back to default formatting.
-/// - `{:ton}` uses `f64` internally, so very large values can lose precision.
 ///
 /// Examples:
 /// ```tolk
@@ -41,7 +40,7 @@
 ///
 /// // Multiple arguments
 /// val info = format("User {} has {} items worth {:ton}", "Alice", 5, 1_000_000_000);
-/// 
+///
 /// // Parse an integer from a string
 /// val num = parseInt("42");
 /// ```
@@ -92,7 +91,7 @@ fun format<T1 = void, T2 = void, T3 = void, T4 = void, T5 = void>(
 /// Parse a decimal string into an int value.
 ///
 /// Leading and trailing whitespace is ignored before parsing.
-/// After trimming, accepts optional leading `-` sign followed by decimal digits.
+/// After trimming, accepts an optional leading sign followed by decimal digits.
 /// Invalid input (non-numeric characters, empty string, whitespace-only string)
 /// fails with an error.
 ///
@@ -115,7 +114,7 @@ fun parseInt(x: string): int {
 /// `<address> (<name>)` are also accepted; the symbolic suffix is ignored.
 /// The returned value is normalized as an internal address; rendered formatting may
 /// differ from input flags, while representing the same account.
-/// Invalid input fails with an error like `Failed to convert address from <input>`.
+/// Invalid input fails with an error like `Cannot parse address: <input>`.
 ///
 /// Example:
 /// ```tolk
@@ -133,6 +132,17 @@ fun parseAddress(addr: string): address {
 /// `Failed to decode cell hex <input>`.
 fun parseCellFromHex(cellHex: string): cell {
     return ffi.cellFromHex(cellHex);
+}
+
+/// Decode a root cell from base64-encoded BOC bytes.
+///
+/// Available since Acton 1.1.
+///
+/// `cellBase64` must be a valid BOC serialized as base64.
+/// Invalid or malformed input (including non-BOC payloads) fails with an error like
+/// `Failed to decode cell base64 <input>`.
+fun parseCellFromBase64(cellBase64: string): cell {
+    return ffi.cellFromBase64(cellBase64);
 }
 
 fun ffi.format(
@@ -155,6 +165,9 @@ fun ffi.convertAddress(addr: string): cell
 
 fun ffi.cellFromHex(cellHex: string): cell
     asm "20 EXTCALL"
+
+fun ffi.cellFromBase64(cellBase64: string): cell
+    asm "57 EXTCALL"
 
 fun ffi.parseInt(x: string): int?
     asm "47 EXTCALL"

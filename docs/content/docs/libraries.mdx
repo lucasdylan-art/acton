@@ -54,12 +54,12 @@ The CLI walks through:
 
 Upon success, the output includes the **library hash** used to reference the library from other contracts.
 
-```text noCopy
+```text noCopy title="terminal"
 ...
 > Enter amount in TON (at least 0.1124 TON for 1 year):
 > Send 0.1124 TON to publish library? Note that any extra TON will be refunded. Yes
-  ✓ Transaction sent successfully
-  → Library should be available soon at hash: b993c68...
+✓ Transaction sent successfully
+→ Library should be available soon at hash: b993c68...
 ```
 
 ### Advanced options
@@ -71,8 +71,11 @@ Publish raw code with `--code` or run non-interactively:
 acton library publish --code "te6cckEBAQEAAgAAAEysuc0="
 
 # Non-interactive mode
-acton library publish Math --duration 100d --wallet my-wallet --net mainnet
+acton library publish Math --duration 100d --amount 0.2 --wallet my-wallet \
+                                               --net mainnet --yes --local
 ```
+
+Use `--local` or `--global` to skip the metadata storage prompt and save the library entry to `libraries.toml` or `global.libraries.toml`.
 
 ## Monitoring library status
 

@@ -65,7 +65,7 @@ Acton faucet can give 2 testnet Toncoin twice within the 24-hour span for a sing
 <Callout>
   To avoid local computational work and solve captcha instead, use the [Testgiver TON bot in Telegram](https://t.me/testgiver_ton_bot).
 
-  For larger allocations of up to 5000 Toncoin, submit a [request form](https://ton.org/dev/opportunities/testnet).
+  For larger allocations of up to 5000 Toncoin, submit a [request form](https://builders.ton.org/opportunities/testnet).
 </Callout>
 
 Add `--airdrop` to request testnet Toncoin during creation:
@@ -137,7 +137,7 @@ acton script deploy.tolk --net testnet
 
 Without `--net`, `scripts.wallet()` creates a local test wallet with the same name. This makes it easy to exercise the script logic before broadcasting.
 
-To use a wallet from an external wallet service such as Tonkeeper, pass `--tonconnect` to connect to it through the TON Connect protocol. This way, connected wallets override locally configured ones and are injected into the `scripts.wallet()` selection:
+To use a wallet from an external wallet service such as Tonkeeper, pass `--tonconnect` together with `--net` to connect to it through the TON Connect protocol. In this mode, `promptWallet()` returns `tonconnect`, and `scripts.wallet(...)` resolves to the connected wallet address instead of opening local wallet keys:
 
 ```bash
 acton script deploy.tolk --net testnet --tonconnect

@@ -1,12 +1,14 @@
 use super::utils::handle_result;
+use crate::api::toncenter_v2 as v2;
 use crate::localnet::Localnet;
-use crate::node;
 use crate::server::models::{
     FaucetRequest, GetAddressNameQuery, GetCompilerAbiQuery, RegisterCompilerAbisRequest,
-    SetAddressNameRequest,
+    SendBocRequest, SetAddressNameRequest, SetShardAccountRequest, StatePathRequest,
 };
+use crate::server::{StartupWallet, StateSourceInfo};
 use crate::types::Hash256;
 use axum::{Json, extract::State};
+use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -20,18 +22,77 @@ pub async fn faucet(
     .await
 }
 
-pub async fn get_state_source(State(node): State<Arc<Localnet>>) -> Json<Value> {
-    handle_result(node.get_state_source(), |res| {
-        serde_json::to_value(res).unwrap_or(Value::Null)
-    })
+#[derive(Serialize)]
+struct LocalnetAdminStatus {
+    uptime_seconds: u64,
+    last_block_seqno: u64,
+    #[serde(flatten)]
+    state_source: StateSourceInfo,
+}
+
+pub async fn get_status(
+    State(node): State<Arc<Localnet>>,
+    State(state_source): State<Arc<StateSourceInfo>>,
+) -> Json<Value> {
+    handle_result(
+        async move {
+            let masterchain_info = node.get_masterchain_info().await?;
+
+            Ok(LocalnetAdminStatus {
+                uptime_seconds: node.uptime_seconds(),
+                last_block_seqno: u64::from(masterchain_info.last.seqno),
+                state_source: state_source.as_ref().clone(),
+            })
+        },
+        |res| serde_json::to_value(res).unwrap_or(Value::Null),
+    )
     .await
 }
 
-pub async fn set_state_source(
-    State(node): State<Arc<Localnet>>,
-    Json(payload): Json<node::StateSource>,
+pub async fn get_startup_wallets(
+    State(startup_wallets): State<Arc<Vec<StartupWallet>>>,
 ) -> Json<Value> {
-    handle_result(node.set_state_source(payload), |()| Value::Null).await
+    handle_result(
+        async move { Ok::<_, anyhow::Error>(startup_wallets.as_ref().clone()) },
+        |res| serde_json::to_value(res).unwrap_or(Value::Null),
+    )
+    .await
+}
+
+pub async fn dump_state(
+    State(node): State<Arc<Localnet>>,
+    Json(payload): Json<StatePathRequest>,
+) -> Json<Value> {
+    handle_result(node.dump_state(payload.path), |()| Value::Null).await
+}
+
+pub async fn load_state(
+    State(node): State<Arc<Localnet>>,
+    Json(payload): Json<StatePathRequest>,
+) -> Json<Value> {
+    handle_result(node.load_state(payload.path), |()| Value::Null).await
+}
+
+pub async fn set_shard_account(
+    State(node): State<Arc<Localnet>>,
+    Json(payload): Json<SetShardAccountRequest>,
+) -> Json<Value> {
+    handle_result(
+        node.set_shard_account(payload.address, payload.shard_account),
+        |()| Value::Null,
+    )
+    .await
+}
+
+pub async fn send_internal_message(
+    State(node): State<Arc<Localnet>>,
+    Json(payload): Json<SendBocRequest>,
+) -> Json<Value> {
+    handle_result(
+        node.send_internal_boc(payload.boc),
+        v2::map_send_boc_return_hash,
+    )
+    .await
 }
 
 pub async fn set_address_name(

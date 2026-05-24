@@ -77,15 +77,15 @@ Pins project-level tooling versions. Acton checks this section before running
 project commands and exits with an error when the installed CLI version does
 not match the configured version.
 
-| Field   | Type     | Required | Description                                                            |
-|:--------|:---------|:---------|:-----------------------------------------------------------------------|
-| `acton` | `string` | No       | Required Acton CLI version without a leading `v`, for example `1.0.0`. |
+| Field   | Type     | Required | Description                                                                          |
+|:--------|:---------|:---------|:-------------------------------------------------------------------------------------|
+| `acton` | `string` | No       | Required Acton CLI version without a leading `v`, for example `{{ acton_version }}`. |
 
 Example:
 
 ```acton-toml title="Acton.toml"
 [toolchain]
-acton = "1.0.0"
+acton = "{{ acton_version }}"
 ```
 
 `acton up` remains available when the configured version does not match, so the
@@ -97,10 +97,26 @@ This section is a map where each key is a contract name and the value is a contr
 
 | Field          | Type     | Required | Description                                                             |
 |:---------------|:---------|:---------|:------------------------------------------------------------------------|
-| `display-name` | `string` | No       | Human-readable name of the contract. Defaults to the contract name.          |
+| `display-name` | `string` | No       | Human-readable name of the contract. Defaults to the contract name.     |
 | `src`          | `string` | **Yes**  | Path to the contract source file (`.tolk`) or a precompiled `.boc`.     |
+| `types`        | `string` | No       | Tolk interface file used to produce ABI for a precompiled `.boc`.       |
 | `depends`      | `array`  | No       | List of contract dependencies. Can be simple names or detailed objects. |
 | `output`       | `string` | No       | Custom path where the compiled `.boc` should be saved.                  |
+
+For precompiled `.boc` contracts, `types` can point to a Tolk file that contains
+the contract header, message/storage types, and getters. Acton still loads code
+from `src`, but uses the `types` file to produce ABI and generate wrappers.
+
+```acton-toml title="Acton.toml"
+[contracts.Precompiled]
+display-name = "Precompiled"
+src = "contracts/Precompiled.boc"
+types = "contracts/Precompiled.types.tolk"
+```
+
+Do not put dependencies on the BoC contract itself: it is already compiled.
+Instead, put `depends = ["Precompiled"]` on the `.tolk` contract that needs the
+BoC code.
 
 ### Contract dependencies
 
@@ -152,7 +168,7 @@ output-abi = "build/abi"
 output-fift = "build/fift"
 ```
 
-`acton build --out-dir <DIR>`, `acton build --gen-dir <DIR>`, `acton build --output-abi <DIR>`, and `acton build --output-fift <DIR>` override these values for a single run. Config values here are project-root-relative. The CLI flags stay relative to the current working directory unless absolute paths are passed. Arbitrary `.boc` contracts are skipped in ABI and Fift output.
+`acton build --out-dir <DIR>`, `acton build --gen-dir <DIR>`, `acton build --output-abi <DIR>`, and `acton build --output-fift <DIR>` override these values for a single run. Config values here are project-root-relative. The CLI flags stay relative to the current working directory unless absolute paths are passed. Precompiled `.boc` contracts emit ABI only when their contract config sets `types`; they never emit Fift output.
 
 ## `[wrappers]`
 
@@ -264,6 +280,8 @@ Configures the behavior of `acton test`.
 | `fork-block-number`         | `integer`  | -             | Specific block number to fork from.                                    |
 | `fail-fast`                 | `boolean`  | `false`       | Stop execution after the first test failure.                           |
 | `fail-on-diff`              | `boolean`  | `false`       | Exit with non-zero code when profiling differs from baseline snapshot. |
+| `ui`                        | `boolean`  | `false`       | Enable the browser test UI server.                                     |
+| `ui-port`                   | `integer`  | `12344`       | Port for the browser test UI server.                                   |
 | `mutation`                  | `object`   | -             | Configuration for mutation testing (see below).                        |
 
 TON Center API keys are configured through the process environment, not `Acton.toml`: use `TONCENTER_TESTNET_API_KEY` or `TONCENTER_MAINNET_API_KEY` when the built-in fork target needs authentication.
@@ -277,6 +295,7 @@ Configures default coverage behavior for `acton test`.
 | `enabled`          | `boolean` | `false` | Enable code coverage collection.                                |
 | `format`           | `string`  | `lcov`  | Format for coverage report (`lcov`, `text`).                    |
 | `output-file`      | `string`  | -       | Path to save the coverage report.                               |
+| `minimum-percent`  | `float`   | -       | Fail non-UI coverage runs below this final coverage score.      |
 | `include-wrappers` | `boolean` | `false` | Include files from the `@wrappers` mapping in coverage reports. |
 | `include-tests`    | `boolean` | `false` | Include `.test.tolk` files in coverage reports.                 |
 
@@ -426,15 +445,15 @@ Defines network settings used by `--net` and `--fork-net`.
 
 | Field      | Type     | Required                                | Description                                                                                                                                                                                                                                                                                     |
 |:-----------|:---------|:----------------------------------------|:------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `api.v2`   | `string` | Yes for custom, optional for `localnet` | TON Center API v2 URL. For `localnet`, if omitted, Acton uses `http://localhost:<localnet.port>/api/v2`; if `[localnet].port` is not set, it falls back to port `5411`.                                                                                                                          |
-| `api.v3`   | `string` | No                                      | TON Center API v3 URL. For `localnet`, if omitted, Acton uses `http://localhost:<localnet.port>/api/v3`; if `[localnet].port` is not set, it falls back to port `5411`.                                                                                                                          |
-| `explorer` | `string` | No                                      | Base explorer URL for transaction links. Acton appends `/tx/<hash>` automatically (adds `/tx/` if missing). If omitted, Acton derives explorer links from `api.v2` (`<scheme>://<host>/explorer/tx/<hash>`). For default `localnet`, this becomes `http://localhost:<port>/explorer/tx/<hash>`. |
+| `api.v2`   | `string` | Yes for custom, optional for `localnet` | TON Center API v2 URL. For `localnet`, if omitted, Acton uses `http://127.0.0.1:<localnet.port>/api/v2`; if `[localnet].port` is not set, it falls back to port `5411`.                                                                                                                         |
+| `api.v3`   | `string` | No                                      | TON Center API v3 URL. For `localnet`, if omitted, Acton uses `http://127.0.0.1:<localnet.port>/api/v3`; if `[localnet].port` is not set, it falls back to port `5411`.                                                                                                                         |
+| `explorer` | `string` | No                                      | Base explorer URL for transaction links. Acton appends `/tx/<hash>` automatically (adds `/tx/` if missing). If omitted, Acton derives explorer links from `api.v2` (`<scheme>://<host>/explorer/tx/<hash>`). For default `localnet`, this becomes `http://127.0.0.1:<port>/explorer/tx/<hash>`. |
 
 Example:
 
 ```acton-toml title="Acton.toml"
 [networks.localnet]
-explorer = "http://localhost:3006"
+explorer = "http://127.0.0.1:3006"
 
 [networks.my-custom-net]
 api = { v2 = "https://my-custom-net.com/api/v2", v3 = "https://my-custom-net.com/api/v3" }
@@ -485,7 +504,8 @@ import "@utils/logic" // Resolves to ./libs/utils/logic.tolk
 
 ### Built-in project mappings
 
-Projects created with `acton new` or updated with `acton init` usually contain
+Projects created with `acton new`, or initialized with `acton init` when
+`Acton.toml` did not exist yet, usually contain
 these default mappings:
 
 | Mapping      | Default path                       | Common use                                               |
@@ -504,7 +524,7 @@ import "@contracts/types"
 import "@wrappers/Counter.gen"
 ```
 
-These defaults are written into `Acton.toml` by project scaffolding commands such as `acton new` and `acton init`. The exact path depends on the scaffold layout: standard templates use `contracts/`, `tests/`, and `wrappers/`, while `--app` scaffolds use `contracts/src/`, `contracts/tests/`, and `contracts/wrappers/`.
+These defaults are written into `Acton.toml` by project scaffolding commands such as `acton new` and by `acton init` only when it creates a missing manifest. The exact path depends on the scaffold layout: standard templates use `contracts/`, `tests/`, and `wrappers/`, while `--app` scaffolds use `contracts/src/`, `contracts/tests/`, and `contracts/wrappers/`.
 
 Acton does not silently recreate deleted folders during normal workflows. To recreate missing folders, manually restore them from Git within the Git-managed project.
 

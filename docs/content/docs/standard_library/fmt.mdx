@@ -27,7 +27,6 @@ Format rules and edge cases:
   fail at runtime with a parser error that includes a byte offset.
 - For non-int arguments, `{:x}` and `{:ton}` fall back to default formatting.
 - For non-cell/slice/builder/Cell\<T> arguments, `{:cell-tree}` falls back to default formatting.
-- `{:ton}` uses `f64` internally, so very large values can lose precision.
 
 Examples:
 ```tolk
@@ -89,7 +88,7 @@ format("{:x}", "abc");   // "abc"
 format("{:ton}", true);  // "true"
 ```
 
-<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L69" />
+<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L68" />
 
 ## `parseInt`
 
@@ -100,7 +99,7 @@ fun parseInt(x: string): int
 Parse a decimal string into an int value.
 
 Leading and trailing whitespace is ignored before parsing.
-After trimming, accepts optional leading `-` sign followed by decimal digits.
+After trimming, accepts an optional leading sign followed by decimal digits.
 Invalid input (non-numeric characters, empty string, whitespace-only string)
 fails with an error.
 
@@ -111,7 +110,7 @@ val negative = parseInt("-42");
 val withWhitespace = parseInt(" 42 ");
 ```
 
-<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L105" />
+<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L104" />
 
 ## `parseAddress`
 
@@ -126,14 +125,14 @@ Accepted forms include raw addresses (`0:...`) and user-friendly TON addresses
 `<address> (<name>)` are also accepted; the symbolic suffix is ignored.
 The returned value is normalized as an internal address; rendered formatting may
 differ from input flags, while representing the same account.
-Invalid input fails with an error like `Failed to convert address from <input>`.
+Invalid input fails with an error like `Cannot parse address: <input>`.
 
 Example:
 ```tolk
 val address = parseAddress("kQCPFJYFqhowz0BRAfqNPdLOC1_Rlupki_0BezWU6rHk5lbt");
 ```
 
-<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L124" />
+<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L123" />
 
 ## `parseCellFromHex`
 
@@ -147,5 +146,22 @@ Decode a root cell from hex-encoded BOC bytes.
 Invalid or malformed input (including non-BOC payloads) fails with an error like
 `Failed to decode cell hex <input>`.
 
-<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L134" />
+<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L133" />
+
+## `parseCellFromBase64`
+
+<AvailabilityBadge since="Acton 1.1" />
+
+```tolk
+fun parseCellFromBase64(cellBase64: string): cell
+```
+
+Decode a root cell from base64-encoded BOC bytes.
+
+
+`cellBase64` must be a valid BOC serialized as base64.
+Invalid or malformed input (including non-BOC payloads) fails with an error like
+`Failed to decode cell base64 <input>`.
+
+<SourceCodeLink href="https://github.com/ton-blockchain/acton/blob/master/lib/fmt.tolk#L144" />
 

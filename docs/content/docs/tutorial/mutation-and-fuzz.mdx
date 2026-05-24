@@ -18,7 +18,7 @@ The mutation engine makes small, deliberate changes — for example, changing `o
 acton test --mutate --mutate-contract Voter
 ```
 
-```acton-cli-mutate noCopy
+```acton-cli-mutate noCopy title="terminal"
 $ acton test --mutate --mutate-contract Voter
 
 Mutation Testing
@@ -57,7 +57,8 @@ Survived Mutants
     24 │     assert (!storage.hasVoted) throw Errors.AlreadyVoted;
     25 │     storage.hasVoted = true;
 
-  Why it's bad: This assertion is not covered by tests. This could lead to security vulnerabilities if the condition is not enforced.
+  Why it's bad: This assertion is not covered by tests. This could lead to security vulnerabilities
+  if the condition is not enforced.
 ────────────────────────────────────────────────────────────
 These mutants were not caught by your tests!
 Consider adding more test cases to improve mutation coverage.
@@ -86,7 +87,7 @@ get fun `test voter exits with AlreadyVoted on duplicate`() {
     expect(res2).toHaveFailedTx({
         from: poll.address,
         to: voter.address,
-        exitCode: Errors.AlreadyVoted as int,
+        exitCode: Errors.AlreadyVoted,
     });
 }
 ```
@@ -97,7 +98,7 @@ Rerun to confirm the survivor is gone:
 acton test --mutate --mutate-contract Voter
 ```
 
-```acton-cli noCopy
+```acton-cli noCopy title="terminal"
     Total mutants        8
   ✓ Killed               8
   ✗ Survived             0
@@ -130,8 +131,6 @@ A fuzz test in Acton is a parameterized `get fun` annotated with `@test.fuzz`. T
 Because `option: uint8` already constrains generated values to `0..255`, no extra bounds are needed:
 
 ```tolk title="tests/poll.test.tolk"
-import "@acton/testing/expect"
-
 @test.fuzz
 get fun `test fuzz vote option boundary`(option: uint8) {
     val (poll, _, alice, _) = setupTest();
@@ -150,7 +149,7 @@ get fun `test fuzz vote option boundary`(option: uint8) {
         expect(res).toHaveFailedTx({
             from: alice.address,
             to: poll.address,
-            exitCode: Errors.InvalidOption as int,
+            exitCode: Errors.InvalidOption,
         });
     }
 }
@@ -160,7 +159,7 @@ get fun `test fuzz vote option boundary`(option: uint8) {
 acton test --fuzz-seed 42 -f "fuzz vote option"
 ```
 
-```acton-cli noCopy
+```acton-cli noCopy title="terminal"
 $ acton test --fuzz-seed 42 -f "fuzz vote option"
    Compiling contracts
     Finished in 608.21µs
@@ -168,7 +167,7 @@ $ acton test --fuzz-seed 42 -f "fuzz vote option"
 
  TEST  <root>/poll
 
- > ./tests/poll.test.tolk (1 test)
+ > tests/poll.test.tolk (1 test)
   ✓ fuzz vote option boundary  145ms (256 runs, seed 42)
 
  ✓ 1 passed in 1 file

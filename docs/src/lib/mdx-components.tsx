@@ -8,9 +8,12 @@ import {
   CommandOptions,
   CommandOptionTitle,
 } from "@/components/CommandOptions"
+import {AvailabilityBadge} from "@/components/AvailabilityBadge"
 import {Callout} from "@/components/Callout"
+import {APIPage} from "@/components/api-page"
 import {File, Files, Folder} from "@/components/Files"
 import {ImageZoom} from "@/components/image-zoom"
+import {Mermaid} from "@/components/Mermaid"
 
 export function getMDXComponents(components?: MDXComponents): MDXComponents {
   return {
@@ -20,11 +23,14 @@ export function getMDXComponents(components?: MDXComponents): MDXComponents {
     CommandOptionMeta,
     CommandOptions,
     CommandOptionTitle,
+    AvailabilityBadge,
     Cards,
     Card,
+    APIPage,
     File,
     Folder,
     Files,
+    Mermaid,
     // See: https://www.fumadocs.dev/docs/ui/components/image-zoom
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     img: props => <ImageZoom {...(props as any)} />,

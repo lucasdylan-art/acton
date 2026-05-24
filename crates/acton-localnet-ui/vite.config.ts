@@ -4,7 +4,7 @@ import react from "@vitejs/plugin-react"
 import {defineConfig} from "vite"
 import {nodePolyfills} from "vite-plugin-node-polyfills"
 
-const localnetTarget = process.env.VITE_LOCALNET_PROXY_TARGET || "http://localhost:3010"
+const localnetTarget = process.env.VITE_LOCALNET_PROXY_TARGET || "http://127.0.0.1:3011"
 
 export default defineConfig({
   plugins: [
@@ -33,7 +33,7 @@ export default defineConfig({
         target: localnetTarget,
         changeOrigin: true,
       },
-      "/admin": {
+      "/acton_": {
         target: localnetTarget,
         changeOrigin: true,
       },

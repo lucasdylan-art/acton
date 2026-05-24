@@ -177,6 +177,10 @@ pub(crate) enum Request {
         boc: BocBytes,
         resp: oneshot::Sender<anyhow::Result<LocalnetBlockTransactions>>,
     },
+    SendInternalBoc {
+        boc: BocBytes,
+        resp: oneshot::Sender<anyhow::Result<LocalnetBlockTransactions>>,
+    },
     GetAddressInformation {
         address: Addr,
         seqno: Option<u32>,
@@ -186,6 +190,11 @@ pub(crate) enum Request {
         address: Addr,
         seqno: Option<u32>,
         resp: oneshot::Sender<anyhow::Result<BocBytes>>,
+    },
+    SetShardAccount {
+        address: Addr,
+        shard_account: BocBytes,
+        resp: oneshot::Sender<anyhow::Result<()>>,
     },
     GetTransactions {
         address: Addr,
@@ -321,13 +330,6 @@ pub(crate) enum Request {
         address: Addr,
         resp: oneshot::Sender<anyhow::Result<Option<String>>>,
     },
-    SetStateSource {
-        source: StateSource,
-        resp: oneshot::Sender<anyhow::Result<()>>,
-    },
-    GetStateSource {
-        resp: oneshot::Sender<anyhow::Result<StateSource>>,
-    },
     RegisterCompilerAbis {
         entries: Vec<(Hash256, Value)>,
         resp: oneshot::Sender<anyhow::Result<()>>,
@@ -348,6 +350,7 @@ pub(crate) enum Request {
 
 pub struct Localnet {
     tx: mpsc::Sender<Request>,
+    started_at: SystemTime,
 }
 
 impl Default for Localnet {
@@ -360,6 +363,7 @@ impl Localnet {
     #[must_use]
     pub fn new(state_source: StateSource, db_path: Option<String>) -> Self {
         let (tx, rx) = mpsc::channel(100);
+        let started_at = SystemTime::now();
 
         std::thread::spawn(move || {
             if let Err(e) = run_node_loop(rx, state_source, db_path) {
@@ -367,7 +371,14 @@ impl Localnet {
             }
         });
 
-        Self { tx }
+        Self { tx, started_at }
+    }
+
+    #[must_use]
+    pub fn uptime_seconds(&self) -> u64 {
+        self.started_at
+            .elapsed()
+            .map_or(0, |duration| duration.as_secs())
     }
 
     pub async fn send_boc(&self, boc_str: String) -> anyhow::Result<LocalnetBlockTransactions> {
@@ -377,6 +388,19 @@ impl Localnet {
             .into();
         let (resp, rx) = oneshot::channel();
         self.tx.send(Request::SendBoc { boc, resp }).await?;
+        rx.await?
+    }
+
+    pub async fn send_internal_boc(
+        &self,
+        boc_str: String,
+    ) -> anyhow::Result<LocalnetBlockTransactions> {
+        let boc = base64::engine::general_purpose::STANDARD
+            .decode(&boc_str)
+            .context("Invalid BOC base64")?
+            .into();
+        let (resp, rx) = oneshot::channel();
+        self.tx.send(Request::SendInternalBoc { boc, resp }).await?;
         rx.await?
     }
 
@@ -408,6 +432,25 @@ impl Localnet {
             .send(Request::GetShardAccountCell {
                 address,
                 seqno,
+                resp,
+            })
+            .await?;
+        rx.await?
+    }
+
+    pub async fn set_shard_account(
+        &self,
+        address_str: String,
+        shard_account: String,
+    ) -> anyhow::Result<()> {
+        let address = Self::parse_addr(&address_str)?;
+        let shard_account =
+            BocBytes::from_base64(&shard_account).context("Invalid shard_account base64")?;
+        let (resp, rx) = oneshot::channel();
+        self.tx
+            .send(Request::SetShardAccount {
+                address,
+                shard_account,
                 resp,
             })
             .await?;
@@ -815,20 +858,6 @@ impl Localnet {
         rx.await?
     }
 
-    pub async fn set_state_source(&self, source: StateSource) -> anyhow::Result<()> {
-        let (resp, rx) = oneshot::channel();
-        self.tx
-            .send(Request::SetStateSource { source, resp })
-            .await?;
-        rx.await?
-    }
-
-    pub async fn get_state_source(&self) -> anyhow::Result<StateSource> {
-        let (resp, rx) = oneshot::channel();
-        self.tx.send(Request::GetStateSource { resp }).await?;
-        rx.await?
-    }
-
     pub async fn register_compiler_abis(
         &self,
         entries: Vec<(Hash256, Value)>,
@@ -919,6 +948,10 @@ fn process_loop_request(node: &mut Node, req: Request) {
             let res = handle_send_boc(node, boc);
             let _ = resp.send(res);
         }
+        Request::SendInternalBoc { boc, resp } => {
+            let res = handle_send_internal_boc(node, boc);
+            let _ = resp.send(res);
+        }
         Request::GetAddressInformation {
             address,
             seqno,
@@ -933,6 +966,14 @@ fn process_loop_request(node: &mut Node, req: Request) {
             resp,
         } => {
             let res = node.get_shard_account_at_block(&address, seqno);
+            let _ = resp.send(res);
+        }
+        Request::SetShardAccount {
+            address,
+            shard_account,
+            resp,
+        } => {
+            let res = node.set_shard_account(&address, shard_account);
             let _ = resp.send(res);
         }
         Request::GetTransactions {
@@ -1121,13 +1162,6 @@ fn process_loop_request(node: &mut Node, req: Request) {
             let res = node.history.address_names.get(&address).cloned();
             let _ = resp.send(Ok(res));
         }
-        Request::SetStateSource { source, resp } => {
-            node.state_source = source;
-            let _ = resp.send(Ok(()));
-        }
-        Request::GetStateSource { resp } => {
-            let _ = resp.send(Ok(node.state_source.clone()));
-        }
         Request::RegisterCompilerAbis { entries, resp } => {
             let res = entries
                 .into_iter()
@@ -1153,7 +1187,24 @@ fn process_loop_request(node: &mut Node, req: Request) {
 fn handle_send_boc(node: &mut Node, boc: BocBytes) -> anyhow::Result<LocalnetBlockTransactions> {
     let msg_hash_norm = normalized_ext_in_hash_from_boc(&boc)?;
     let (msg_hash, tx_hash, seqno, _) = node.send_boc(boc)?;
+    build_send_boc_response(node, msg_hash, msg_hash_norm, tx_hash, seqno)
+}
 
+fn handle_send_internal_boc(
+    node: &mut Node,
+    boc: BocBytes,
+) -> anyhow::Result<LocalnetBlockTransactions> {
+    let (msg_hash, tx_hash, seqno, _) = node.send_internal_boc(boc)?;
+    build_send_boc_response(node, msg_hash, None, tx_hash, seqno)
+}
+
+fn build_send_boc_response(
+    node: &Node,
+    msg_hash: Hash256,
+    msg_hash_norm: Option<Hash256>,
+    tx_hash: Hash256,
+    seqno: Seqno,
+) -> anyhow::Result<LocalnetBlockTransactions> {
     let Some(ext_tx) = node.get_transaction_by_hash(&tx_hash) else {
         anyhow::bail!("Transaction not found after mining")
     };
@@ -1379,6 +1430,11 @@ fn handle_run_get_method(
         || EMPTY_CELL_BASE64.to_owned(),
         |b| base64::engine::general_purpose::STANDARD.encode(b),
     );
+    let libs = node
+        .build_vm_global_libs_boc()?
+        .map_or_else(String::new, |boc| {
+            base64::engine::general_purpose::STANDARD.encode(boc)
+        });
 
     let balance_tokens = meta.cached_balance.unwrap_or(0);
 
@@ -1393,7 +1449,7 @@ fn handle_run_get_method(
         gas_limit: "10000000".to_owned(),
         debug_enabled: false,
         verbosity: ExecutorVerbosity::Short,
-        libs: String::new(),
+        libs,
         extra_currencies: Default::default(),
         prev_blocks_info: None,
     };

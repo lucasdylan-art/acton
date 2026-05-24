@@ -91,6 +91,12 @@ Write output to a file instead of standard output.
 
 Enable only selected lint rules, for example `S003,S001`.
 
+<CommandOptionMeta label="Repeatable">
+
+May be passed multiple times.
+
+</CommandOptionMeta>
+
 </CommandOption>
 
 
@@ -128,6 +134,12 @@ Control when to use colored output.
 
 </CommandOptionMeta>
 
+<CommandOptionMeta label="Default">
+
+`auto`
+
+</CommandOptionMeta>
+
 </CommandOption>
 
 
@@ -150,6 +162,12 @@ Path to the `Acton.toml` file to use for this invocation.
 Use this when running the command outside the project directory or when the
 manifest lives at a non-default location.
 
+<CommandOptionMeta label="Conflicts with">
+
+`--project-root`
+
+</CommandOptionMeta>
+
 </CommandOption>
 
 
@@ -163,7 +181,11 @@ manifest lives at a non-default location.
 Path to the project root to use for configuration discovery and relative
 defaults.
 
-This conflicts with `--manifest-path`.
+<CommandOptionMeta label="Conflicts with">
+
+`--manifest-path`
+
+</CommandOptionMeta>
 
 </CommandOption>
 
@@ -198,9 +220,12 @@ This conflicts with `--manifest-path`.
   could be mistaken for a contract name
 - inline suppressions use rule names, for example
   `// check-disable-next-line unused-variable, write-only-variable`
-- suppressions apply only to the immediately following line and match
-  diagnostic names, including `compiler-error` and `parse-error`; diagnostic
-  codes such as `C001` are not matched
+- suppressions apply only to suppressible linter diagnostics on the immediately
+  following line and match diagnostic names; diagnostic codes such as `C001`
+  are not matched
+- compiler and parser diagnostics reported as `compiler-error` or
+  `parse-error` are emitted outside suppressible lint processing and are not
+  disabled by `check-disable-next-line` or `[lint.rules]`
 - `--fix` applies only linter-provided fixes; diagnostics without a safe fix
   remain in the report
 - `--enable-only` is applied after config is loaded: selected rules keep their

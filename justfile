@@ -123,8 +123,9 @@ build-ui:
 
 check-ui-ci:
     bun run lint
+    bun run fmt:check
 
-check-ui:
+check-ui: fmt-ui
     bun run lint:fix
 
 fmt-ui:

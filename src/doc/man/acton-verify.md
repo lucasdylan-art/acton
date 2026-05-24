@@ -45,7 +45,9 @@ multiple wallets are available.
 {{#option "`--tonconnect`" }}
 Use TON Connect wallet approval for the verification transaction.
 
-This uses the wallet selected in the browser and conflicts with `--wallet`.
+This uses the wallet selected in the browser.
+
+Conflicts with `--wallet`.
 {{/option}}
 
 {{#option "`--tonconnect-port` _port_" }}
@@ -57,7 +59,7 @@ Defaults to `52258`.
 {{#option "`--compiler-version` _version_" }}
 Tolk compiler version to request on the verifier side.
 
-Currently defaults to `1.2.0`.
+Currently defaults to `1.4.1`.
 {{/option}}
 
 {{#option "`--dry-run`" }}
